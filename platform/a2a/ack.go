@@ -107,7 +107,7 @@ func (a *DefaultAcker) Track(sessionKey string, messageIDs []string) {
 	defer a.mu.Unlock()
 	cur := a.sessions[sessionKey]
 	for _, id := range messageIDs {
-		if !contains(cur, id) {
+		if !ackContains(cur, id) {
 			cur = append(cur, id)
 		}
 		st := a.msgs[id]
@@ -228,7 +228,7 @@ func (a *DefaultAcker) Close() {
 	}
 }
 
-func contains(s []string, v string) bool {
+func ackContains(s []string, v string) bool {
 	for _, x := range s {
 		if x == v {
 			return true
