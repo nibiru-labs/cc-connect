@@ -56,7 +56,7 @@ type Platform struct {
 
 	// pong answers liveness pings at platform level and reports whether the
 	// message was consumed. TODO(836-a2a-ack): wire to pong.go; nil = not handled.
-	pong func(ctx context.Context, m Inbound) bool
+	pong func(ctx context.Context, m Inbound) (consumed, settled bool)
 
 	mu       sync.Mutex
 	inflight map[string]bool
@@ -72,7 +72,7 @@ func New(opts map[string]any) (core.Platform, error) {
 	bin, _ := opts["a2a_bin"].(string)
 	c := newCLIClient(bin)
 	p := newPlatform(c, NewAcker(c, AckerConfig{}), opts)
-	p.pong = NewPongHandler(c, 0).Handle
+	p.pong = NewPongHandler(c, 0).HandleSettled
 	return p, nil
 }
 
@@ -215,9 +215,13 @@ func (p *Platform) dispatch(ctx context.Context, handler core.MessageHandler, m 
 		return
 	}
 
-	if p.pong != nil && p.pong(ctx, m) {
-		p.release(m.MessageID, true)
-		return
+	if p.pong != nil {
+		if consumed, settled := p.pong(ctx, m); consumed {
+			// Only a terminal (acked) ping is remembered as done; a failed pong
+			// send or ack must stay retryable on the next poll round.
+			p.release(m.MessageID, settled)
+			return
+		}
 	}
 	if !p.allow[strings.ToLower(m.SenderID)] {
 		slog.Warn("a2a: dropping message from non-roster sender", "sender", m.SenderID, "message_id", m.MessageID)
