@@ -5202,6 +5202,18 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	// doneReaction stores a function to add a "done" emoji after stopTyping.
 	// Set during EventResult handling for multi-round quiet turns.
 	var doneReaction func()
+	// finishP/finishCtx/turnOK track the current turn for TurnFinisher. turnOK
+	// flips to true once the final reply was delivered; every failure path
+	// returns before that, so the default (false) reports the turn as failed.
+	var finishP Platform
+	var finishCtx any
+	turnOK := false
+	finishTurn := func() {
+		if tf, ok := finishP.(TurnFinisher); ok {
+			tf.FinishTurn(e.ctx, finishCtx, turnOK)
+		}
+		finishP = nil
+	}
 	defer func() {
 		if stopTyping != nil {
 			stopTyping()
@@ -5209,6 +5221,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		if doneReaction != nil {
 			doneReaction()
 		}
+		finishTurn()
 	}()
 
 	state.mu.Lock()
@@ -5243,6 +5256,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	}
 	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx, workspaceRenderer)
 	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
+	finishP, finishCtx = state.platform, state.replyCtx
 	state.mu.Unlock()
 
 	// Send instant confirmation reply if enabled and no streaming card is active.
@@ -6335,6 +6349,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				slog.Warn("slow final reply send", "platform", p.Name(), "elapsed", elapsed, "response_len", len(fullResponse))
 			}
 
+			turnOK = true
+
 			// TTS: async voice reply if enabled (skipped for silent replies)
 			if !isSilent && e.tts != nil && e.tts.Enabled && e.tts.TTS != nil {
 				state.mu.Lock()
@@ -6413,6 +6429,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				// Agent continues working — don't add done reaction for this turn.
 				doneReaction = nil
+				// The previous turn is over; report it before the queued one starts.
+				finishTurn()
+				finishP, finishCtx, turnOK = queued.platform, queued.replyCtx, false
 
 				// Drain stale events before starting the next turn. Between
 				// EventResult and Send(), the only buffered events would be

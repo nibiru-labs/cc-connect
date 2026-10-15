@@ -235,6 +235,16 @@ type TypingIndicatorDone interface {
 	AddDoneReaction(replyCtx any)
 }
 
+// TurnFinisher is an optional interface for platforms that need an explicit
+// end-of-turn signal (e.g. a message bus that acks inbound messages only once
+// the turn's final reply was delivered). The engine calls FinishTurn exactly
+// once per turn: ok is true when the turn completed and its reply (if any) was
+// delivered, false on agent error, abnormal exit or delivery failure. Send and
+// Reply are plain deliveries and carry no turn semantics.
+type TurnFinisher interface {
+	FinishTurn(ctx context.Context, replyCtx any, ok bool)
+}
+
 // AtMentionSender is an optional interface for platforms that support @mention in
 // reply messages (e.g. DingTalk). Platforms that implement this interface can
 // include @user notifications when replying in group chats.

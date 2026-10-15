@@ -432,6 +432,100 @@ func (p *stubDoneReactionPlatform) doneSnapshot() (int, []any) {
 	return p.doneCount, ctxs
 }
 
+type stubTurnFinisherPlatform struct {
+	stubPlatformEngine
+	finMu   sync.Mutex
+	fins    []turnFinish
+	sendErr error
+}
+
+func (p *stubTurnFinisherPlatform) Reply(ctx context.Context, rc any, content string) error {
+	if p.sendErr != nil {
+		return p.sendErr
+	}
+	return p.stubPlatformEngine.Reply(ctx, rc, content)
+}
+
+func (p *stubTurnFinisherPlatform) Send(ctx context.Context, rc any, content string) error {
+	if p.sendErr != nil {
+		return p.sendErr
+	}
+	return p.stubPlatformEngine.Send(ctx, rc, content)
+}
+
+type turnFinish struct {
+	replyCtx any
+	ok       bool
+}
+
+func (p *stubTurnFinisherPlatform) FinishTurn(_ context.Context, replyCtx any, ok bool) {
+	p.finMu.Lock()
+	defer p.finMu.Unlock()
+	p.fins = append(p.fins, turnFinish{replyCtx, ok})
+}
+
+func (p *stubTurnFinisherPlatform) finishes() []turnFinish {
+	p.finMu.Lock()
+	defer p.finMu.Unlock()
+	return append([]turnFinish(nil), p.fins...)
+}
+
+func runFinisherTurn(t *testing.T, events ...Event) *stubTurnFinisherPlatform {
+	t.Helper()
+	p := &stubTurnFinisherPlatform{stubPlatformEngine: stubPlatformEngine{n: "a2a"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "a2a:conv"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-fin")
+	state := &interactiveState{agentSession: agentSession, platform: p, replyCtx: "ctx-fin"}
+	e.interactiveStates[sessionKey] = state
+	for _, ev := range events {
+		agentSession.events <- ev
+	}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-fin", time.Now(), nil, nil, state.replyCtx, 0)
+	return p
+}
+
+func TestProcessInteractiveEvents_FinishTurnOKAfterFinalReply(t *testing.T) {
+	p := runFinisherTurn(t, Event{Type: EventResult, Content: "done", Done: true})
+	fins := p.finishes()
+	if len(fins) != 1 || !fins[0].ok || fins[0].replyCtx != "ctx-fin" {
+		t.Fatalf("finishes = %#v, want one ok finish for ctx-fin", fins)
+	}
+}
+
+func TestProcessInteractiveEvents_FinishTurnOKForSilentReply(t *testing.T) {
+	p := runFinisherTurn(t, Event{Type: EventResult, Content: "NO_REPLY", Done: true})
+	fins := p.finishes()
+	if len(fins) != 1 || !fins[0].ok {
+		t.Fatalf("finishes = %#v, want one ok finish", fins)
+	}
+}
+
+func TestProcessInteractiveEvents_FinishTurnFailedOnAgentError(t *testing.T) {
+	p := runFinisherTurn(t, Event{Type: EventError, Error: errors.New("boom")})
+	fins := p.finishes()
+	if len(fins) != 1 || fins[0].ok {
+		t.Fatalf("finishes = %#v, want exactly one failed finish", fins)
+	}
+}
+
+func TestProcessInteractiveEvents_FinishTurnFailedWhenSendFails(t *testing.T) {
+	p := &stubTurnFinisherPlatform{stubPlatformEngine: stubPlatformEngine{n: "a2a"}, sendErr: errors.New("bus down")}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "a2a:conv"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-fin2")
+	state := &interactiveState{agentSession: agentSession, platform: p, replyCtx: "ctx-fin"}
+	e.interactiveStates[sessionKey] = state
+	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-fin", time.Now(), nil, nil, state.replyCtx, 0)
+	fins := p.finishes()
+	if len(fins) != 1 || fins[0].ok {
+		t.Fatalf("finishes = %#v, want exactly one failed finish", fins)
+	}
+}
+
 type stubAskQuestionRichCardPlatform struct {
 	stubCardPlatform
 }

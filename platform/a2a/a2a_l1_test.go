@@ -109,8 +109,8 @@ func TestReplySuccessAndFailure(t *testing.T) {
 	if err := p.Reply(context.Background(), rc, "ok"); err != nil {
 		t.Fatal(err)
 	}
-	if len(c.sent) != 1 || c.sent[0].replyTo != "m1" || c.sent[0].key != "m1-1" || c.sent[0].text != "ok" || a.succeeded != 1 {
-		t.Fatalf("sent=%+v succ=%d", c.sent, a.succeeded)
+	if len(c.sent) != 1 || c.sent[0].replyTo != "m1" || c.sent[0].key != "m1-1" || c.sent[0].text != "ok" {
+		t.Fatalf("sent=%+v", c.sent)
 	}
 	// a second reply in the same turn must not reuse the idempotency key
 	_ = p.Send(context.Background(), rc, "more")
@@ -119,15 +119,8 @@ func TestReplySuccessAndFailure(t *testing.T) {
 	}
 	c.sendErr = errors.New("boom")
 	rc2 := &replyContext{ConversationID: "c2", MessageIDs: []string{"m2"}}
-	if err := p.Reply(context.Background(), rc2, "x"); err == nil || a.failed != 1 {
-		t.Fatalf("err=%v failed=%d", err, a.failed)
-	}
-	// failed turn is redeliverable
-	c.pending = []Inbound{{MessageID: "m2", ConversationID: "c2", SenderID: "dot"}}
-	n := 0
-	p.pollOnce(context.Background(), func(core.Platform, *core.Message) { n++ })
-	if n != 1 {
-		t.Fatal("failed message should be redelivered")
+	if err := p.Reply(context.Background(), rc2, "x"); err == nil {
+		t.Fatal("want send error")
 	}
 }
 
@@ -209,10 +202,8 @@ func TestNewOptions(t *testing.T) {
 	}
 }
 
-// Send is a non-final notification (receipt, permission prompt): it delivers
-// but must not complete the turn, so the message stays in flight and the
-// final Reply is what marks it done and acked.
-func TestNonFinalSendDoesNotCompleteTurn(t *testing.T) {
+// Reply/Send only deliver; the turn completes (dedup + ack) on FinishTurn(ok).
+func TestSendDoesNotCompleteTurnFinishTurnDoes(t *testing.T) {
 	c := &l1Client{pending: []Inbound{{MessageID: "m1", ConversationID: "c1", SenderID: "dot", Text: "hi"}}}
 	a := &l1Acker{}
 	p := newPlatform(c, a, nil)
@@ -223,18 +214,19 @@ func TestNonFinalSendDoesNotCompleteTurn(t *testing.T) {
 	if err := p.Send(context.Background(), rc, "receipt"); err != nil {
 		t.Fatal(err)
 	}
-	if len(c.sent) != 1 || a.succeeded != 0 || a.failed != 0 {
-		t.Fatalf("non-final send must deliver only: sent=%d succ=%d failed=%d", len(c.sent), a.succeeded, a.failed)
-	}
-	p.pollOnce(context.Background(), h)
-	if n != 1 {
-		t.Fatalf("turn completed by non-final send: re-dispatched, dispatches=%d", n)
-	}
 	if err := p.Reply(context.Background(), rc, "final"); err != nil {
 		t.Fatal(err)
 	}
-	if a.succeeded != 1 {
-		t.Fatalf("final reply must succeed the turn, succ=%d", a.succeeded)
+	if len(c.sent) != 2 || a.succeeded != 0 || a.failed != 0 {
+		t.Fatalf("deliveries must not touch the acker: sent=%d succ=%d failed=%d", len(c.sent), a.succeeded, a.failed)
+	}
+	p.pollOnce(context.Background(), h)
+	if n != 1 {
+		t.Fatalf("in-flight turn re-dispatched, dispatches=%d", n)
+	}
+	p.FinishTurn(context.Background(), rc, true)
+	if a.succeeded != 1 || a.failed != 0 {
+		t.Fatalf("FinishTurn(ok) must succeed once: succ=%d failed=%d", a.succeeded, a.failed)
 	}
 	p.pollOnce(context.Background(), h)
 	if n != 1 {
@@ -242,9 +234,26 @@ func TestNonFinalSendDoesNotCompleteTurn(t *testing.T) {
 	}
 }
 
-// A failed non-final Send must not fail the turn or release the message; the
-// turn is only failed by a failed final Reply.
-func TestNonFinalSendFailureDoesNotFailTurn(t *testing.T) {
+func TestFinishTurnFailedReleasesForRedelivery(t *testing.T) {
+	c := &l1Client{pending: []Inbound{{MessageID: "m1", ConversationID: "c1", SenderID: "dot", Text: "hi"}}}
+	a := &l1Acker{}
+	p := newPlatform(c, a, nil)
+	n := 0
+	h := func(core.Platform, *core.Message) { n++ }
+	p.pollOnce(context.Background(), h)
+	rc := &replyContext{ConversationID: "c1", MessageIDs: []string{"m1"}}
+	p.FinishTurn(context.Background(), rc, false)
+	if a.failed != 1 || a.succeeded != 0 {
+		t.Fatalf("succ=%d failed=%d", a.succeeded, a.failed)
+	}
+	p.pollOnce(context.Background(), h)
+	if n != 2 {
+		t.Fatalf("failed turn should be redelivered, dispatches=%d", n)
+	}
+}
+
+// A failed delivery is just an error; only FinishTurn decides the turn outcome.
+func TestSendFailureDoesNotTouchAcker(t *testing.T) {
 	c := &l1Client{sendErr: errors.New("boom")}
 	a := &l1Acker{}
 	p := newPlatform(c, a, nil)
@@ -252,7 +261,9 @@ func TestNonFinalSendFailureDoesNotFailTurn(t *testing.T) {
 	if err := p.Send(context.Background(), rc, "receipt"); err == nil {
 		t.Fatal("want send error")
 	}
-	if a.failed != 0 {
-		t.Fatalf("non-final send failure failed the turn: failed=%d", a.failed)
+	if a.failed != 0 || a.succeeded != 0 {
+		t.Fatalf("succ=%d failed=%d", a.succeeded, a.failed)
 	}
 }
+
+var _ core.TurnFinisher = (*Platform)(nil)
