@@ -138,7 +138,7 @@ func TestReplySuccessCallsTurnSucceeded(t *testing.T) {
 	}
 	ak.mu.Lock()
 	defer ak.mu.Unlock()
-	if len(ak.ok) != 1 || ak.ok[0] != "a2a:c1" || len(ak.failed) != 0 {
+	if len(ak.ok) != 1 || ak.ok[0] != "m1" || len(ak.failed) != 0 {
 		t.Fatalf("ok=%v failed=%v", ak.ok, ak.failed)
 	}
 }
@@ -212,7 +212,7 @@ func TestRetryExhaustionAcks(t *testing.T) {
 	// each redelivery is handed to the engine again, so it is tracked again
 	for i := 0; i < 2; i++ {
 		ak.Track("a2a:c1", []string{"m1"})
-		ak.TurnFailed("a2a:c1", errBoom)
+		ak.TurnFailedIDs("a2a:c1", []string{"m1"}, errBoom)
 	}
 	eventually(t, "acked after exhausting retries", func() bool { return len(c.ackedCopy()) == 1 })
 }
@@ -222,7 +222,7 @@ func TestTurnSucceededAcksAllTracked(t *testing.T) {
 	c := &fakeClient{}
 	ak := newL2Acker(c, 3)
 	ak.Track("a2a:c1", []string{"m1", "m2"})
-	ak.TurnSucceeded("a2a:c1")
+	ak.TurnSucceededIDs([]string{"m1", "m2"})
 	eventually(t, "both acked", func() bool { return len(c.ackedCopy()) == 2 })
 }
 
@@ -378,4 +378,37 @@ func TestReadErrorKeepsPolling(t *testing.T) {
 	c.readErr = nil
 	c.mu.Unlock()
 	eventually(t, "recovered", func() bool { return len(r.all()) == 1 })
+}
+
+// 规格: 按本轮 message IDs 结算 — m2 在 m1 回合结束前已入队同一 session,
+// m1 的 FinishTurn(成功/失败) 都不得 ACK 或记失败 m2
+func TestFinishTurnDoesNotSettleQueuedNextMessage(t *testing.T) {
+	for _, ok := range []bool{true, false} {
+		c := &fakeClient{pending: []Inbound{in("m1", "c1", "grok", "a"), in("m2", "c1", "grok", "b")}}
+		ak := newL2Acker(c, 3)
+		p, r := startP(t, c, ak, nil)
+		eventually(t, "both dispatched", func() bool { return len(r.all()) == 2 })
+		p.FinishTurn(context.Background(), r.all()[0].ReplyCtx, ok)
+		if ok {
+			eventually(t, "m1 acked", func() bool { return len(c.ackedCopy()) == 1 })
+		}
+		time.Sleep(50 * time.Millisecond)
+		for _, id := range c.ackedCopy() {
+			if id == "m2" {
+				t.Fatalf("ok=%v: m2 acked by m1's turn", ok)
+			}
+		}
+		if ak.Admit("m2") {
+			t.Fatalf("ok=%v: m2 must remain in flight", ok)
+		}
+		p.FinishTurn(context.Background(), r.all()[1].ReplyCtx, true)
+		eventually(t, "m2 acked by own turn", func() bool {
+			for _, id := range c.ackedCopy() {
+				if id == "m2" {
+					return true
+				}
+			}
+			return false
+		})
+	}
 }

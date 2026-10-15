@@ -3,6 +3,7 @@ package a2a
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -99,10 +100,15 @@ func (a *fakeAcker) Track(key string, ids []string) {
 	defer a.mu.Unlock()
 	a.tracked[key] = append(a.tracked[key], ids...)
 }
-func (a *fakeAcker) TurnSucceeded(key string) { a.mu.Lock(); a.ok = append(a.ok, key); a.mu.Unlock() }
-func (a *fakeAcker) TurnFailed(key string, err error) {
+func (a *fakeAcker) Admit(string) bool { return true }
+func (a *fakeAcker) TurnSucceededIDs(ids []string) {
 	a.mu.Lock()
-	a.failed = append(a.failed, key)
+	a.ok = append(a.ok, strings.Join(ids, ","))
+	a.mu.Unlock()
+}
+func (a *fakeAcker) TurnFailedIDs(key string, ids []string, err error) {
+	a.mu.Lock()
+	a.failed = append(a.failed, strings.Join(ids, ","))
 	a.mu.Unlock()
 }
 
