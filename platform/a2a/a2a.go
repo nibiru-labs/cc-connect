@@ -57,7 +57,7 @@ type Platform struct {
 	maxChunk int
 
 	// pong answers liveness pings at platform level and reports whether the
-	// message was consumed. TODO(836-a2a-ack): wire to pong.go; nil = not handled.
+	// message was consumed (pong.go); nil = not handled.
 	pong func(ctx context.Context, m Inbound) bool
 
 	mu       sync.Mutex
@@ -117,10 +117,14 @@ func newPlatform(c Client, a Acker, opts map[string]any) *Platform {
 	if maxChunk < 64 {
 		maxChunk = defaultMaxChunk
 	}
-	return &Platform{
+	pl := &Platform{
 		client: c, acker: a, allow: allow, interval: interval, maxChunk: maxChunk,
 		inflight: map[string]bool{}, done: map[string]time.Time{}, replies: map[string]int{},
 	}
+	if c != nil {
+		pl.pong = NewPongHandler(c, 0).Handle
+	}
+	return pl
 }
 
 func (p *Platform) Name() string { return "a2a" }
@@ -197,6 +201,13 @@ func (p *Platform) gcDone() {
 func (p *Platform) dispatch(ctx context.Context, handler core.MessageHandler, m Inbound) {
 	if m.MessageID == "" {
 		return
+	}
+	// The Acker may hold a message back (turn in progress, retry backoff,
+	// pending ack retry); pings and roster drops below are not tracked by it.
+	if _, isPing := PingRequestID(m.Text); !isPing {
+		if ad, ok := p.acker.(interface{ Admit(string) bool }); ok && !ad.Admit(m.MessageID) {
+			return
+		}
 	}
 	p.mu.Lock()
 	if p.inflight[m.MessageID] {

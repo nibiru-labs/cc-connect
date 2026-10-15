@@ -131,6 +131,7 @@ func TestReplySuccessCallsTurnSucceeded(t *testing.T) {
 	if err := p.Reply(context.Background(), rc, "answer"); err != nil {
 		t.Fatal(err)
 	}
+	p.FinishTurn(context.Background(), rc, true)
 	sent := c.sentCopy()
 	if len(sent) != 1 || sent[0].ReplyTo != "m1" || sent[0].Text != "answer" {
 		t.Fatalf("sent=%+v", sent)
@@ -151,6 +152,7 @@ func TestReplyFailureCallsTurnFailedNoAck(t *testing.T) {
 	if err := p.Reply(context.Background(), rc, "answer"); err == nil {
 		t.Fatal("want error")
 	}
+	p.FinishTurn(context.Background(), rc, false)
 	ak.mu.Lock()
 	defer ak.mu.Unlock()
 	if len(ak.failed) != 1 || len(ak.ok) != 0 {
@@ -172,6 +174,10 @@ func TestAckOnlyAfterSuccessfulReply(t *testing.T) {
 	if err := p.Reply(context.Background(), rc, "done"); err != nil {
 		t.Fatal(err)
 	}
+	if len(c.ackedCopy()) != 0 {
+		t.Fatalf("acked by Reply before FinishTurn: %v", c.ackedCopy())
+	}
+	p.FinishTurn(context.Background(), rc, true)
 	eventually(t, "m1 acked", func() bool { a := c.ackedCopy(); return len(a) == 1 && a[0] == "m1" })
 }
 
@@ -184,15 +190,18 @@ func TestFailedReplyIsRedeliveredThenAcked(t *testing.T) {
 	if err := p.Reply(context.Background(), rc, "a"); err == nil {
 		t.Fatal("want error")
 	}
+	p.FinishTurn(context.Background(), rc, false)
 	if len(c.ackedCopy()) != 0 {
 		t.Fatalf("acked after failure: %v", c.ackedCopy())
 	}
 	// redelivered to the engine (dedup slot released after failure)
 	eventually(t, "redelivered", func() bool { return len(r.all()) >= 2 })
 	c.setSendErr(nil)
-	if err := p.Reply(context.Background(), r.all()[1].ReplyCtx, "a"); err != nil {
+	rc2 := r.all()[1].ReplyCtx
+	if err := p.Reply(context.Background(), rc2, "a"); err != nil {
 		t.Fatal(err)
 	}
+	p.FinishTurn(context.Background(), rc2, true)
 	eventually(t, "acked after success", func() bool { return len(c.ackedCopy()) == 1 })
 }
 
@@ -316,7 +325,7 @@ func TestMaxChunkConfigurable(t *testing.T) {
 	}
 }
 
-// 规格: 分块发送中途失败 -> 返回错误且 TurnFailed (不 ack)
+// 规格: 分块发送中途失败 -> 返回错误，引擎随后 FinishTurn(false) -> TurnFailed (不 ack)
 func TestChunkFailureMidwayIsError(t *testing.T) {
 	ak := newFakeAcker()
 	c := &fakeClient{pending: []Inbound{in("m1", "c1", "grok", "q")}}
@@ -326,6 +335,7 @@ func TestChunkFailureMidwayIsError(t *testing.T) {
 	if err := p.Reply(context.Background(), rc, strings.Repeat("a", 200)); err == nil {
 		t.Fatal("want error")
 	}
+	p.FinishTurn(context.Background(), rc, false)
 	ak.mu.Lock()
 	defer ak.mu.Unlock()
 	if len(ak.ok) != 0 || len(ak.failed) != 1 {
