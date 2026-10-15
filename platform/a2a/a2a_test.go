@@ -18,6 +18,7 @@ func in(id, conv, sender, text string) Inbound {
 func startP(t *testing.T, c Client, a Acker, extra map[string]any) (*Platform, *recorder) {
 	t.Helper()
 	p := newTestPlatform(t, c, a, extra)
+	p.pong = NewPongHandler(c, 0).HandleSettled // New() wires this; newPlatform leaves it nil
 	r := &recorder{}
 	if err := p.Start(r.handle); err != nil {
 		t.Fatalf("Start: %v", err)
