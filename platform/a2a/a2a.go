@@ -250,25 +250,22 @@ func (p *Platform) release(id string, completed bool) {
 	}
 }
 
-// Reply delivers the final reply of a turn. Its success completes the turn
-// (dedup + ACK once the Acker is wired).
+// Reply and Send only deliver; neither carries turn semantics. The engine
+// reports the end of a turn through FinishTurn, which is what acks (or
+// releases for redelivery) the inbound messages.
 func (p *Platform) Reply(ctx context.Context, replyCtx any, content string) error {
-	return p.send(ctx, replyCtx, content, true)
+	return p.send(ctx, replyCtx, content)
 }
 
-// Send delivers a non-final notification (receipt, permission prompt, ...).
-// It never completes the turn, so an interim message cannot cause the inbound
-// message to be deduped or acked before the agent has answered.
 func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error {
-	return p.send(ctx, replyCtx, content, false)
+	return p.send(ctx, replyCtx, content)
 }
 
-func (p *Platform) send(ctx context.Context, replyCtx any, content string, final bool) error {
+func (p *Platform) send(ctx context.Context, replyCtx any, content string) error {
 	rc, ok := replyCtx.(*replyContext)
 	if !ok || rc == nil || len(rc.MessageIDs) == 0 {
 		return fmt.Errorf("a2a: invalid reply context %T", replyCtx)
 	}
-	sessionKey := "a2a:" + rc.ConversationID
 	first := rc.MessageIDs[0]
 	replyTo := rc.MessageIDs[len(rc.MessageIDs)-1]
 
@@ -283,22 +280,30 @@ func (p *Platform) send(ctx context.Context, replyCtx any, content string, final
 			idem = fmt.Sprintf("%s-r%d-%d", first, n, i+1)
 		}
 		if err := p.client.SendReply(ctx, replyTo, idem, text); err != nil {
-			err = fmt.Errorf("a2a: send chunk %d/%d: %w", i+1, len(chunks), err)
-			if final {
-				p.acker.TurnFailed(sessionKey, err)
-				p.finish(rc, false)
-			}
-			return err
+			return fmt.Errorf("a2a: send chunk %d/%d: %w", i+1, len(chunks), err)
 		}
 	}
 	p.mu.Lock()
 	p.replies[first]++
 	p.mu.Unlock()
-	if final {
-		p.acker.TurnSucceeded(sessionKey)
-		p.finish(rc, true)
-	}
 	return nil
+}
+
+// FinishTurn implements core.TurnFinisher. The engine calls it exactly once
+// per turn: ok means the turn completed and its reply was delivered, so the
+// inbound messages are acked; otherwise they are released for redelivery.
+func (p *Platform) FinishTurn(_ context.Context, replyCtx any, ok bool) {
+	rc, isRC := replyCtx.(*replyContext)
+	if !isRC || rc == nil || len(rc.MessageIDs) == 0 {
+		return
+	}
+	sessionKey := "a2a:" + rc.ConversationID
+	if ok {
+		p.acker.TurnSucceeded(sessionKey)
+	} else {
+		p.acker.TurnFailed(sessionKey, fmt.Errorf("a2a: turn did not complete"))
+	}
+	p.finish(rc, ok)
 }
 
 func (p *Platform) finish(rc *replyContext, ok bool) {
