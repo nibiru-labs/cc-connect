@@ -4050,7 +4050,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 
 	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
-	promptContent = e.withHandoff(interactiveKey, promptContent) // nibiru#836
+	promptContent, ackHandoff := e.withHandoff(interactiveKey, promptContent) // nibiru#836
 
 	sendStart := time.Now()
 	state.mu.Lock()
@@ -4069,7 +4069,11 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			sendDone <- fmt.Errorf("agent session became nil")
 			return
 		}
-		sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
+		err := as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
+		if err == nil {
+			ackHandoff() // nibiru#836: keep the handoff when the send fails
+		}
+		sendDone <- err
 	}()
 
 	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)

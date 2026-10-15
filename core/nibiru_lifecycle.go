@@ -102,34 +102,44 @@ func (e *Engine) saveHandoff(key, summary string) error {
 	return os.Rename(tmp, filepath.Join(dir, base+".pending.md"))
 }
 
-// consumeHandoff returns the pending handoff for key (once) and clears it.
-func (e *Engine) consumeHandoff(key string) string {
+// peekHandoff returns the pending handoff for key without clearing it.
+func (e *Engine) peekHandoff(key string) (string, string) {
 	dir := e.handoffDir()
 	if dir == "" {
-		return ""
+		return "", ""
 	}
 	p := filepath.Join(dir, handoffFileBase(key)+".pending.md")
 	b, err := os.ReadFile(p)
 	if err != nil {
-		return ""
+		return "", ""
 	}
-	_ = os.Remove(p)
-	s := strings.TrimSpace(string(b))
-	if s == "" {
-		return ""
+	return strings.TrimSpace(string(b)), p
+}
+
+// discardPendingHandoff drops the pending handoff for key (the dated archive stays).
+func (e *Engine) discardPendingHandoff(key string) {
+	if _, p := e.peekHandoff(key); p != "" {
+		_ = os.Remove(p)
 	}
-	return s
 }
 
 // withHandoff prepends a pending handoff (if any) to the first prompt of a fresh session.
-func (e *Engine) withHandoff(key, prompt string) string {
-	h := e.consumeHandoff(key)
+// The handoff stays on disk until the caller invokes ack after a successful Send, so a
+// failed send keeps it for the next attempt (nibiru#836 review P2).
+func (e *Engine) withHandoff(key, prompt string) (string, func()) {
+	h, p := e.peekHandoff(key)
 	if h == "" {
-		return prompt
+		return prompt, func() {}
 	}
 	slog.Info("handoff: injected into new session", "session_key", key, "runes", utf8.RuneCountInString(h))
+	ack := func() {
+		// Remove only the file we injected; a newer handoff written meanwhile is kept.
+		if b, err := os.ReadFile(p); err == nil && strings.TrimSpace(string(b)) == h {
+			_ = os.Remove(p)
+		}
+	}
 	return "【交接摘要：上一段会话因上下文用尽被轮换。你的记忆只来自这份摘要和仓库/issue，其余以实际查证为准】\n" +
-		h + "\n【交接摘要结束】\n\n" + prompt
+		h + "\n【交接摘要结束】\n\n" + prompt, ack
 }
 
 // historyFallbackSummary builds a summary from the transcript when the model gave none.
@@ -199,6 +209,14 @@ collect:
 		}
 	}
 
+	// Messages that arrived while the summary was being written must not be dropped by
+	// the cleanup below: keep the current session, let the caller drain the queue and
+	// retry rotation after a later turn (nibiru#836 review P1).
+	if n := e.queuedCount(state); n > 0 {
+		slog.Info("rotate: messages queued during handoff, postponing rotation", "session_key", key, "queued", n)
+		return false
+	}
+
 	summary := strings.TrimSpace(strings.Join(parts, ""))
 	if summary == "" {
 		summary = historyFallbackSummary(session.GetHistory(0))
@@ -206,6 +224,11 @@ collect:
 	if err := e.saveHandoff(key, summary); err != nil {
 		// Without a saved summary a rotation would lose memory: keep the old session.
 		slog.Error("rotate: cannot save handoff, keeping current session", "session_key", key, "error", err)
+		return false
+	}
+	if n := e.queuedCount(state); n > 0 {
+		e.discardPendingHandoff(key)
+		slog.Info("rotate: messages queued while saving handoff, postponing rotation", "session_key", key, "queued", n)
 		return false
 	}
 
@@ -217,6 +240,12 @@ collect:
 	session.Unlock(lockGen)
 	slog.Info("rotate: session rotated with handoff", "session_key", key)
 	return true
+}
+
+func (e *Engine) queuedCount(state *interactiveState) int {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return len(state.pendingMessages)
 }
 
 // HasPlatformForSession reports whether sessionKey (optionally workspace-prefixed)
