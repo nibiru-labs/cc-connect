@@ -226,19 +226,63 @@ collect:
 		slog.Error("rotate: cannot save handoff, keeping current session", "session_key", key, "error", err)
 		return false
 	}
-	if n := e.queuedCount(state); n > 0 {
+	if rotateBeforeCommitHook != nil {
+		rotateBeforeCommitHook()
+	}
+	if !e.commitRotate(state, session, key, lockGen) {
 		e.discardPendingHandoff(key)
-		slog.Info("rotate: messages queued while saving handoff, postponing rotation", "session_key", key, "queued", n)
+		slog.Info("rotate: messages queued before commit, postponing rotation", "session_key", key)
 		return false
 	}
+	sessions.Save()
 
+	// The old state is out of the map and the session is unlocked: new messages now
+	// start a fresh agent session (with the handoff). Close the old agent outside locks.
+	state.markStopped()
+	state.mu.Lock()
+	pending := state.pending
+	state.pending = nil
+	state.mu.Unlock()
+	if pending != nil {
+		pending.resolve()
+	}
+	if as != nil {
+		e.closeAgentSessionWithTimeout(key, as, p, replyCtx)
+	}
 	e.send(p, replyCtx, "上下文已接近上限，已写交接摘要并轮换为新会话；下一条消息会带着摘要继续。")
-	e.cleanupInteractiveState(key, state)
+	slog.Info("rotate: session rotated with handoff", "session_key", key)
+	return true
+}
+
+// rotateBeforeCommitHook is a test seam: it runs right before the atomic commit.
+var rotateBeforeCommitHook func()
+
+// commitRotate is the single atomic transition of a rotation (nibiru#836 review P1).
+// Under interactiveMu → state.mu (the same order queueMessageForBusySession uses) it
+// re-checks that no message is queued, detaches the old agent, removes the state from
+// the map, resets the session and releases the busy lock. A message that arrives
+// before this point is still queued and aborts the rotation; one that arrives after
+// finds the session unlocked and is processed normally by a fresh agent session, so no
+// message can be queued on the dying state and dropped by cleanup.
+func (e *Engine) commitRotate(state *interactiveState, session *Session, key string, lockGen uint64) bool {
+	e.interactiveMu.Lock()
+	defer e.interactiveMu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.pendingMessages) > 0 {
+		return false
+	}
+	state.agentSession = nil
+	if state.agentSessionIdleCancel != nil {
+		state.agentSessionIdleCancel()
+		state.agentSessionIdleCancel = nil
+	}
+	if cur, ok := e.interactiveStates[key]; ok && cur == state {
+		delete(e.interactiveStates, key)
+	}
 	session.SetAgentSessionID("", "")
 	session.ClearHistory()
-	sessions.Save()
 	session.Unlock(lockGen)
-	slog.Info("rotate: session rotated with handoff", "session_key", key)
 	return true
 }
 

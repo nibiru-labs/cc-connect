@@ -169,3 +169,80 @@ func TestRunRotate_PostponedWhenMessageQueuedDuringSummary(t *testing.T) {
 		t.Fatalf("no pending handoff may be left for the old session: %q", got)
 	}
 }
+
+// Barrier exactly before the commit: a message queued there aborts the rotation and
+// stays queued; nothing may answer it with "session reset" (review P1, round 2).
+func TestRunRotate_MessageAtCommitBarrierIsKept(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	base := newControllableSession("rot4")
+	state := &interactiveState{platform: p, replyCtx: "ctx"}
+	state.agentSession = &rotateSession{controllableAgentSession: base, reply: "摘要"}
+	e := NewEngine("t", &controllableAgent{nextSession: base}, []Platform{p}, "", LangEnglish)
+	e.SetDataDir(t.TempDir())
+	key := "test:rot4"
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+	session := e.sessions.GetOrCreateActive(key)
+	session.SetAgentSessionID("old-id", "claudecode")
+	session.TryLock()
+
+	rotateBeforeCommitHook = func() {
+		state.mu.Lock()
+		state.pendingMessages = append(state.pendingMessages, queuedMessage{content: "恰在提交前到达"})
+		state.mu.Unlock()
+	}
+	defer func() { rotateBeforeCommitHook = nil }()
+
+	if e.runRotate(state, session, e.sessions, key, p, "ctx", 0) {
+		t.Fatal("must not rotate when a message arrives right before commit")
+	}
+	state.mu.Lock()
+	n, alive := len(state.pendingMessages), state.agentSession != nil
+	state.mu.Unlock()
+	if n != 1 || !alive || session.GetAgentSessionID() != "old-id" {
+		t.Fatalf("rotation must be a no-op: queued=%d alive=%v id=%q", n, alive, session.GetAgentSessionID())
+	}
+	e.interactiveMu.Lock()
+	cur := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	if cur != state {
+		t.Fatal("state must stay in the map")
+	}
+	if got, _ := e.withHandoff(key, "next"); got != "next" {
+		t.Fatalf("no pending handoff may remain: %q", got)
+	}
+}
+
+// After commit the old state is gone and the session is free, so a later message
+// cannot be queued on the dying state; it takes the normal path instead.
+func TestRunRotate_AfterCommitNoQueueOnOldState(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	base := newControllableSession("rot5")
+	state := &interactiveState{platform: p, replyCtx: "ctx"}
+	state.agentSession = &rotateSession{controllableAgentSession: base, reply: "摘要"}
+	e := NewEngine("t", &controllableAgent{nextSession: base}, []Platform{p}, "", LangEnglish)
+	e.SetDataDir(t.TempDir())
+	key := "test:rot5"
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+	session := e.sessions.GetOrCreateActive(key)
+	_, _ = session.TryLock()
+
+	if !e.runRotate(state, session, e.sessions, key, p, "ctx", 0) {
+		t.Fatal("expected rotation")
+	}
+	e.interactiveMu.Lock()
+	_, still := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	if still {
+		t.Fatal("old state must be removed atomically at commit")
+	}
+	if e.queueMessageForBusySession(p, &Message{SessionKey: key, Content: "x"}, key) {
+		t.Fatal("no message may be queued on the rotated-out state")
+	}
+	if _, ok := session.TryLock(); !ok {
+		t.Fatal("session must be unlocked at commit so new messages are processed normally")
+	}
+}
