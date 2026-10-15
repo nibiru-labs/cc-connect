@@ -113,6 +113,7 @@ type Config struct {
 	Hooks              []HookConfig            `toml:"hooks"`
 	IdleTimeoutMins    *int                    `toml:"idle_timeout_mins,omitempty"`  // max minutes between consecutive agent events; 0 = no timeout; default 120
 	BusyTimeoutMins    *int                    `toml:"busy_timeout_mins,omitempty"`  // minutes a dead agent's session busy lock may be held before the next message breaks it; 0 = disable; default 2
+	FirstEventTimeoutSecs *int `toml:"first_event_timeout_secs,omitempty"` // seconds to wait for the first agent event of a turn; default 300, 0 = disable (nibiru#836)
 	MaxTurnTimeMins    *int                    `toml:"max_turn_time_mins,omitempty"` // absolute wall-clock cap per turn in minutes; 0 = disabled (default)
 	// WorkspaceIdleTimeoutMins controls the workspace idle reaper timeout
 	// (multi-workspace mode) for every engine in the process. 0 disables
@@ -459,6 +460,9 @@ type AutoCompressConfig struct {
 	Enabled    *bool `toml:"enabled,omitempty"`      // default false
 	MaxTokens  *int  `toml:"max_tokens,omitempty"`   // estimated token threshold to trigger /compress
 	MinGapMins *int  `toml:"min_gap_mins,omitempty"` // minimum minutes between auto-compress runs (default 30)
+	Percent    *int  `toml:"percent,omitempty"`      // also compress at this percent of the context window (nibiru#836)
+	RotatePercent   *int `toml:"rotate_percent,omitempty"`    // rotate session with a handoff summary at this percent (nibiru#836); 0 = off
+	RotateMaxTokens *int `toml:"rotate_max_tokens,omitempty"` // absolute fallback when the window is unknown (nibiru#836)
 	// AllowHeuristic restores deciding from the text-length heuristic when an
 	// agent that CAN report exact usage has not reported it yet. Default false:
 	// such turns make no decision and wait for the next turn, which carries the
