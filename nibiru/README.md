@@ -42,6 +42,7 @@ into one agent session: key `unified:<project>`, messages serialised through the
 reply ctx kept (replies return to their source), prompts prefixed with `[cc-connect source platform= sender_id=
 sender_name= conversation= msg_id=]`. Slash commands/permission answers are not tagged. Sample:
 `nibiru/deploy/config.unified.example.toml` (DingTalk + WeChat + A2A in one project). Code: `core/unified_session.go`.
+Not supported together with `mode = "multi-workspace"` (config load rejects the combination).
 Note: a message arriving while a turn runs gets the stock "queued" notice on its own platform (on A2A that is one extra message).
 
 ## Switching the inbox consumer (one consumer only!)

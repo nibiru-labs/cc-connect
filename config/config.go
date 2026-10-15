@@ -1109,6 +1109,9 @@ func (c *Config) validateInternal(permissive bool) error {
 				return fmt.Errorf("config: %s.platforms[%d].type is required", prefix, j)
 			}
 		}
+		if proj.UnifiedSession && proj.Mode == "multi-workspace" {
+			return fmt.Errorf("project %q: unified_session conflicts with multi-workspace mode (one shared session cannot route per-channel workspaces)", proj.Name)
+		}
 		if proj.Mode == "multi-workspace" {
 			if proj.BaseDir == "" {
 				return fmt.Errorf("project %q: multi-workspace mode requires base_dir", proj.Name)
