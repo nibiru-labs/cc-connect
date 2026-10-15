@@ -126,8 +126,39 @@ func (a *DefaultAcker) TurnSucceeded(sessionKey string) {
 	ids := a.sessions[sessionKey]
 	delete(a.sessions, sessionKey)
 	a.mu.Unlock()
+	a.ackIDs(ids)
+}
+
+// TurnSucceededIDs acks exactly the given messages (the turn's own message
+// IDs). Messages of a later, still-queued turn on the same session are left
+// alone.
+func (a *DefaultAcker) TurnSucceededIDs(ids []string) {
+	a.mu.Lock()
+	a.untrackLocked(ids)
+	a.mu.Unlock()
+	a.ackIDs(ids)
+}
+
+func (a *DefaultAcker) ackIDs(ids []string) {
 	for _, id := range ids {
 		a.ackOne(context.Background(), id)
+	}
+}
+
+// untrackLocked removes ids from every session's running set.
+func (a *DefaultAcker) untrackLocked(ids []string) {
+	for key, cur := range a.sessions {
+		kept := cur[:0:0]
+		for _, id := range cur {
+			if !ackContains(ids, id) {
+				kept = append(kept, id)
+			}
+		}
+		if len(kept) == 0 {
+			delete(a.sessions, key)
+		} else {
+			a.sessions[key] = kept
+		}
 	}
 }
 
@@ -138,6 +169,20 @@ func (a *DefaultAcker) TurnFailed(sessionKey string, err error) {
 	a.mu.Lock()
 	ids := a.sessions[sessionKey]
 	delete(a.sessions, sessionKey)
+	a.mu.Unlock()
+	a.failIDs(sessionKey, ids, err)
+}
+
+// TurnFailedIDs is TurnFailed for exactly the given messages.
+func (a *DefaultAcker) TurnFailedIDs(sessionKey string, ids []string, err error) {
+	a.mu.Lock()
+	a.untrackLocked(ids)
+	a.mu.Unlock()
+	a.failIDs(sessionKey, ids, err)
+}
+
+func (a *DefaultAcker) failIDs(sessionKey string, ids []string, err error) {
+	a.mu.Lock()
 	var giveUp []string
 	for _, id := range ids {
 		st := a.msgs[id]

@@ -69,20 +69,29 @@ func NewPongHandler(c Client, maxAttempts int) *PongHandler {
 	return &PongHandler{client: c, maxAttempts: maxAttempts, attempts: make(map[string]int)}
 }
 
-// Handle returns true when in is a ping that was consumed here (the caller must
-// not forward it to the engine, nor ack it itself). Returns false for anything else.
+// Handle reports whether in is a ping that was consumed here; see HandleSettled.
+func (h *PongHandler) Handle(ctx context.Context, in Inbound) bool {
+	consumed, _ := h.HandleSettled(ctx, in)
+	return consumed
+}
+
+// HandleSettled returns consumed=true when in is a ping handled here (the caller
+// must not forward it to the engine, nor ack it itself), false for anything else.
+// settled=true means the ping reached a terminal state (acked); settled=false
+// means it is still unacked and must be retried on the next poll round, so the
+// caller must not remember it as done.
 //
 // claude-cloud pings get a pong then an ack. A failed pong send leaves the
 // message unacked so the next poll round retries; after maxAttempts failures it
-// is acked anyway. Pings from other senders are only acked.
-func (h *PongHandler) Handle(ctx context.Context, in Inbound) bool {
+// is acked anyway. A failed ack also leaves it unsettled. Pings from other
+// senders are only acked.
+func (h *PongHandler) HandleSettled(ctx context.Context, in Inbound) (consumed, settled bool) {
 	rid, ok := PingRequestID(in.Text)
 	if !ok {
-		return false
+		return false, false
 	}
 	if in.SenderID != PingSender {
-		h.ack(ctx, in.MessageID)
-		return true
+		return true, h.ack(ctx, in.MessageID)
 	}
 	err := h.client.SendReply(ctx, in.MessageID, "pong-"+rid, PongBody(rid))
 	if err != nil {
@@ -92,22 +101,26 @@ func (h *PongHandler) Handle(ctx context.Context, in Inbound) bool {
 		h.mu.Unlock()
 		if n < h.maxAttempts {
 			slog.Warn("a2a: pong send failed, will retry", "message_id", in.MessageID, "attempt", n, "error", err)
-			return true
+			return true, false
 		}
 		slog.Error("a2a: pong send failed, giving up", "message_id", in.MessageID, "attempts", n, "error", err)
 	} else {
 		slog.Info("a2a: pong sent", "message_id", in.MessageID)
 	}
-	h.mu.Lock()
-	delete(h.attempts, in.MessageID)
-	h.mu.Unlock()
-	h.ack(ctx, in.MessageID)
-	return true
+	settled = h.ack(ctx, in.MessageID)
+	if settled {
+		h.mu.Lock()
+		delete(h.attempts, in.MessageID)
+		h.mu.Unlock()
+	}
+	return true, settled
 }
 
-func (h *PongHandler) ack(ctx context.Context, id string) {
+func (h *PongHandler) ack(ctx context.Context, id string) bool {
 	if err := h.client.Ack(ctx, id); err != nil {
 		// Unacked ping reappears next poll; the pong key is idempotent.
 		slog.Warn("a2a: ack ping failed", "message_id", id, "error", err)
+		return false
 	}
+	return true
 }
