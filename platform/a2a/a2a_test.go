@@ -79,10 +79,7 @@ func TestAllowFromConfigurable(t *testing.T) {
 
 func TestDefaultAllowFrom(t *testing.T) {
 	c := &fakeClient{}
-	p, err := newWithClient(map[string]any{"poll_interval": "10ms"}, c, newFakeAcker())
-	if err != nil {
-		t.Fatal(err)
-	}
+	p := newPlatform(c, newFakeAcker(), map[string]any{"poll_interval": "10ms"})
 	c.pending = []Inbound{in("a", "c1", "hermes", "x"), in("b", "c2", "claude-cloud", "y"), in("c", "c3", "nobody", "z")}
 	r := &recorder{}
 	if err := p.Start(r.handle); err != nil {
@@ -167,7 +164,7 @@ func TestReplyFailureCallsTurnFailedNoAck(t *testing.T) {
 // 规格: 成功后才 ack — 真实 L2 Acker 端到端
 func TestAckOnlyAfterSuccessfulReply(t *testing.T) {
 	c := &fakeClient{pending: []Inbound{in("m1", "c1", "grok", "q")}}
-	p, r := startP(t, c, newTestAcker(c, 3), nil)
+	p, r := startP(t, c, newL2Acker(c, 3), nil)
 	rc := replyCtxOf(t, r)
 	if len(c.ackedCopy()) != 0 {
 		t.Fatalf("acked before reply: %v", c.ackedCopy())
@@ -182,7 +179,7 @@ func TestAckOnlyAfterSuccessfulReply(t *testing.T) {
 func TestFailedReplyIsRedeliveredThenAcked(t *testing.T) {
 	c := &fakeClient{pending: []Inbound{in("m1", "c1", "grok", "q")}}
 	c.setSendErr(errBoom)
-	p, r := startP(t, c, newTestAcker(c, 5), nil)
+	p, r := startP(t, c, newL2Acker(c, 5), nil)
 	rc := replyCtxOf(t, r)
 	if err := p.Reply(context.Background(), rc, "a"); err == nil {
 		t.Fatal("want error")
@@ -202,18 +199,19 @@ func TestFailedReplyIsRedeliveredThenAcked(t *testing.T) {
 // 规格: 超过 N 次后告警并 ack, 防止死循环
 func TestRetryExhaustionAcks(t *testing.T) {
 	c := &fakeClient{}
-	ak := newTestAcker(c, 2)
-	ak.Track("a2a:c1", []string{"m1"})
-	ak.TurnFailed("a2a:c1", errBoom)
-	ak.TurnFailed("a2a:c1", errBoom)
-	ak.TurnFailed("a2a:c1", errBoom)
+	ak := newL2Acker(c, 2)
+	// each redelivery is handed to the engine again, so it is tracked again
+	for i := 0; i < 2; i++ {
+		ak.Track("a2a:c1", []string{"m1"})
+		ak.TurnFailed("a2a:c1", errBoom)
+	}
 	eventually(t, "acked after exhausting retries", func() bool { return len(c.ackedCopy()) == 1 })
 }
 
 // 规格: 多条消息覆盖同一回合, 成功后统一 ack
 func TestTurnSucceededAcksAllTracked(t *testing.T) {
 	c := &fakeClient{}
-	ak := newTestAcker(c, 3)
+	ak := newL2Acker(c, 3)
 	ak.Track("a2a:c1", []string{"m1", "m2"})
 	ak.TurnSucceeded("a2a:c1")
 	eventually(t, "both acked", func() bool { return len(c.ackedCopy()) == 2 })
@@ -224,7 +222,7 @@ const pingBody = `{"type":"nibiru.ping.v1","request_id":"0123456789abcdef","from
 
 func TestPingFromCloudRepliesPongAndSkipsModel(t *testing.T) {
 	c := &fakeClient{pending: []Inbound{in("p1", "c9", "claude-cloud", pingBody)}}
-	_, r := startP(t, c, newTestAcker(c, 3), nil)
+	_, r := startP(t, c, newL2Acker(c, 3), nil)
 	eventually(t, "pong sent", func() bool { return len(c.sentCopy()) == 1 })
 	s := c.sentCopy()[0]
 	if s.ReplyTo != "p1" || s.Key != "pong-0123456789abcdef" ||
@@ -240,7 +238,7 @@ func TestPingFromCloudRepliesPongAndSkipsModel(t *testing.T) {
 // 规格: 其他发件人的 ping 只 ack, 不回复, 不进模型
 func TestPingFromOthersOnlyAcked(t *testing.T) {
 	c := &fakeClient{pending: []Inbound{in("p1", "c9", "dot", pingBody)}}
-	_, r := startP(t, c, newTestAcker(c, 3), nil)
+	_, r := startP(t, c, newL2Acker(c, 3), nil)
 	eventually(t, "acked", func() bool { return len(c.ackedCopy()) == 1 })
 	time.Sleep(50 * time.Millisecond)
 	if len(c.sentCopy()) != 0 || len(r.all()) != 0 {
@@ -249,7 +247,7 @@ func TestPingFromOthersOnlyAcked(t *testing.T) {
 }
 
 // 规格: Reply/Send 分块 — max_chunk 默认 6000 字节, rune 边界, 前缀 [i/n sha256:<全文前12位>], 键 <message_id>-<i>
-func TestChunking(t *testing.T) {
+func TestSpecChunking(t *testing.T) {
 	text := strings.Repeat("你好世界", 1200) // 4800 runes = 14400 bytes
 	sum := sha256.Sum256([]byte(text))
 	want := hex.EncodeToString(sum[:])[:12]
@@ -336,7 +334,7 @@ func TestChunkFailureMidwayIsError(t *testing.T) {
 }
 
 // 规格: Stop 必须让轮询 goroutine 退出
-func TestStopEndsPolling(t *testing.T) {
+func TestSpecStopEndsPolling(t *testing.T) {
 	c := &fakeClient{}
 	p := newTestPlatform(t, c, newFakeAcker(), nil)
 	if err := p.Start((&recorder{}).handle); err != nil {

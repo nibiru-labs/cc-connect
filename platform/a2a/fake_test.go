@@ -127,8 +127,7 @@ func (r *recorder) all() []*core.Message {
 // ---- adapters to L1/L2 implementation (single place to fix if names differ) ----
 
 // newTestPlatform builds the platform under test with an injected Client and Acker.
-// TODO(836-L1): assumes `newWithClient(opts map[string]any, c Client, a Acker) (*Platform, error)`
-// (acker may be nil => platform builds the real L2 acker itself).
+// Uses L1's newPlatform(c Client, a Acker, opts map[string]any) *Platform.
 func newTestPlatform(t *testing.T, c Client, a Acker, extra map[string]any) *Platform {
 	t.Helper()
 	opts := map[string]any{
@@ -138,17 +137,16 @@ func newTestPlatform(t *testing.T, c Client, a Acker, extra map[string]any) *Pla
 	for k, v := range extra {
 		opts[k] = v
 	}
-	p, err := newWithClient(opts, c, a)
-	if err != nil {
-		t.Fatalf("newWithClient: %v", err)
-	}
-	return p
+	return newPlatform(c, a, opts)
 }
 
-// newTestAcker builds the real L2 Acker.
-// TODO(836-L2): assumes `NewAcker(c Client, maxRetries int, backoff time.Duration) Acker`.
-func newTestAcker(c Client, maxRetries int) Acker {
-	return NewAcker(c, maxRetries, time.Millisecond)
+// newL2Acker builds the real L2 Acker.
+// Uses L2's NewAcker(c Client, cfg AckerConfig) *DefaultAcker.
+func newL2Acker(c Client, maxRetries int) Acker {
+	return NewAcker(c, AckerConfig{
+		MaxAttempts: maxRetries,
+		Backoff:     func(int) time.Duration { return time.Millisecond },
+	})
 }
 
 func eventually(t *testing.T, what string, cond func() bool) {
