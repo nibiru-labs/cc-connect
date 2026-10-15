@@ -1,0 +1,31 @@
+# Example: A2A as a chat platform in cc-connect (nibiru#836, plan B).
+# Merge this [[projects]] block into ~/.cc-connect/config.toml, then run switch-to-a2a.sh.
+# Only ONE consumer may read the A2A inbox: stop com.nibiru.sakura-runner first (the script does).
+
+[[projects]]
+name = "sakura-a2a"
+# Idle for 8h -> fresh session (same as the dingtalk project).
+reset_on_idle_mins = 480
+
+[projects.agent]
+type = "claudecode"
+
+[projects.agent.options]
+# A2A projects default to sonnet; dingtalk projects switch via /model.
+model = "sonnet"
+work_dir = "/Users/surlymo/workspace/nibiru"
+mode = "bypassPermissions"
+
+[projects.agent.options.env]
+NIBIRU_AGENT = "sakura"
+
+[[projects.platforms]]
+type = "a2a"
+
+[projects.platforms.options]
+# Roster: messages from anyone else are logged, acked and dropped (never reach the model).
+allow_from = "grok,dot,claude-cloud,hermes"
+# Option names match platform/a2a/a2a.go (nibiru-labs/cc-connect#7); all optional.
+# a2a_bin = "/Users/surlymo/bin/a2a"  # A2A CLI, absolute path (no ~ expansion; default $HOME/bin/a2a)
+# poll_interval = "5s"        # inbox polling interval (default 5s)
+# max_chunk = 6000            # bytes per reply chunk (default 6000)
