@@ -208,3 +208,51 @@ func TestNewOptions(t *testing.T) {
 		t.Fatal("bad defaults")
 	}
 }
+
+// Send is a non-final notification (receipt, permission prompt): it delivers
+// but must not complete the turn, so the message stays in flight and the
+// final Reply is what marks it done and acked.
+func TestNonFinalSendDoesNotCompleteTurn(t *testing.T) {
+	c := &l1Client{pending: []Inbound{{MessageID: "m1", ConversationID: "c1", SenderID: "dot", Text: "hi"}}}
+	a := &l1Acker{}
+	p := newPlatform(c, a, nil)
+	n := 0
+	h := func(core.Platform, *core.Message) { n++ }
+	p.pollOnce(context.Background(), h)
+	rc := &replyContext{ConversationID: "c1", MessageIDs: []string{"m1"}}
+	if err := p.Send(context.Background(), rc, "receipt"); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.sent) != 1 || a.succeeded != 0 || a.failed != 0 {
+		t.Fatalf("non-final send must deliver only: sent=%d succ=%d failed=%d", len(c.sent), a.succeeded, a.failed)
+	}
+	p.pollOnce(context.Background(), h)
+	if n != 1 {
+		t.Fatalf("turn completed by non-final send: re-dispatched, dispatches=%d", n)
+	}
+	if err := p.Reply(context.Background(), rc, "final"); err != nil {
+		t.Fatal(err)
+	}
+	if a.succeeded != 1 {
+		t.Fatalf("final reply must succeed the turn, succ=%d", a.succeeded)
+	}
+	p.pollOnce(context.Background(), h)
+	if n != 1 {
+		t.Fatalf("completed turn re-dispatched, dispatches=%d", n)
+	}
+}
+
+// A failed non-final Send must not fail the turn or release the message; the
+// turn is only failed by a failed final Reply.
+func TestNonFinalSendFailureDoesNotFailTurn(t *testing.T) {
+	c := &l1Client{sendErr: errors.New("boom")}
+	a := &l1Acker{}
+	p := newPlatform(c, a, nil)
+	rc := &replyContext{ConversationID: "c1", MessageIDs: []string{"m1"}}
+	if err := p.Send(context.Background(), rc, "receipt"); err == nil {
+		t.Fatal("want send error")
+	}
+	if a.failed != 0 {
+		t.Fatalf("non-final send failure failed the turn: failed=%d", a.failed)
+	}
+}

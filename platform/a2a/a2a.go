@@ -250,15 +250,20 @@ func (p *Platform) release(id string, completed bool) {
 	}
 }
 
+// Reply delivers the final reply of a turn. Its success completes the turn
+// (dedup + ACK once the Acker is wired).
 func (p *Platform) Reply(ctx context.Context, replyCtx any, content string) error {
-	return p.send(ctx, replyCtx, content)
+	return p.send(ctx, replyCtx, content, true)
 }
 
+// Send delivers a non-final notification (receipt, permission prompt, ...).
+// It never completes the turn, so an interim message cannot cause the inbound
+// message to be deduped or acked before the agent has answered.
 func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error {
-	return p.send(ctx, replyCtx, content)
+	return p.send(ctx, replyCtx, content, false)
 }
 
-func (p *Platform) send(ctx context.Context, replyCtx any, content string) error {
+func (p *Platform) send(ctx context.Context, replyCtx any, content string, final bool) error {
 	rc, ok := replyCtx.(*replyContext)
 	if !ok || rc == nil || len(rc.MessageIDs) == 0 {
 		return fmt.Errorf("a2a: invalid reply context %T", replyCtx)
@@ -279,16 +284,20 @@ func (p *Platform) send(ctx context.Context, replyCtx any, content string) error
 		}
 		if err := p.client.SendReply(ctx, replyTo, idem, text); err != nil {
 			err = fmt.Errorf("a2a: send chunk %d/%d: %w", i+1, len(chunks), err)
-			p.acker.TurnFailed(sessionKey, err)
-			p.finish(rc, false)
+			if final {
+				p.acker.TurnFailed(sessionKey, err)
+				p.finish(rc, false)
+			}
 			return err
 		}
 	}
 	p.mu.Lock()
 	p.replies[first]++
 	p.mu.Unlock()
-	p.acker.TurnSucceeded(sessionKey)
-	p.finish(rc, true)
+	if final {
+		p.acker.TurnSucceeded(sessionKey)
+		p.finish(rc, true)
+	}
 	return nil
 }
 
