@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -125,8 +126,18 @@ poll_interval = "200ms"
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = e.cmd.Process.Kill()
-		_ = e.cmd.Wait()
+		// Stop gracefully first so cc-connect and its stub claude child are
+		// gone before t.TempDir is removed.
+		_ = e.cmd.Process.Signal(syscall.SIGTERM)
+		done := make(chan struct{})
+		go func() { _ = e.cmd.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = e.cmd.Process.Kill()
+			<-done
+		}
+		time.Sleep(300 * time.Millisecond)
 		if t.Failed() {
 			t.Logf("cc-connect output:\n%s", e.out.String())
 		}
@@ -258,4 +269,51 @@ func TestNonRosterDroppedAndAcked(t *testing.T) {
 	if p := e.prompts(); len(p) != 0 {
 		t.Fatalf("model saw non-roster prompt: %v", p)
 	}
+}
+
+// m2 is queued behind m1 on the same conversation while m1's turn is still
+// running. m1 finishing (successfully or not) must settle only m1.
+func TestQueuedNextMessageNotSettledByPreviousTurn(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		m1      string
+		m1Acked bool
+	}{
+		{"m1-succeeds", "first [stub:slow]", true},
+		{"m1-fails", "first [stub:slow] [stub:fail]", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := start(t, startOpts{})
+			e.enqueue(queue.Msg{MessageID: "m1", ConversationID: "c1", SenderID: "dot", Text: tc.m1})
+			e.waitFor("m1 turn started", wait, func(queue.State) bool { return len(e.prompts()) >= 1 })
+			e.enqueue(queue.Msg{MessageID: "m2", ConversationID: "c1", SenderID: "dot", Text: "second-question"})
+
+			if tc.m1Acked {
+				st := e.waitFor("m1 acked", wait, func(s queue.State) bool { return contains(s.Acked, "m1") })
+				// m2's own turn may already be done; what must not happen is an ack without its reply.
+				if contains(st.Acked, "m2") && !repliedTo(st, "m2") {
+					t.Fatalf("m1's turn acked the queued m2: acked=%v sent=%+v", st.Acked, st.Sent)
+				}
+			} else {
+				// m1 failed: it is redelivered later, but m2 must not be acked by m1's failure.
+				time.Sleep(3 * time.Second)
+				if st := e.state(); contains(st.Acked, "m2") && !repliedTo(st, "m2") {
+					t.Fatalf("m2 acked without its own reply: acked=%v sent=%+v", st.Acked, st.Sent)
+				}
+			}
+			st := e.waitFor("m2 replied and acked", wait, func(s queue.State) bool { return contains(s.Acked, "m2") })
+			if !repliedTo(st, "m2") {
+				t.Fatalf("m2 acked without a reply sent: %+v", st.Sent)
+			}
+		})
+	}
+}
+
+func repliedTo(st queue.State, id string) bool {
+	for _, s := range st.Sent {
+		if s.ReplyTo == id {
+			return true
+		}
+	}
+	return false
 }

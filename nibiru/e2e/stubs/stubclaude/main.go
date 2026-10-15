@@ -2,7 +2,8 @@
 // It remembers every user turn of its own process (so "context carry-over"
 // is observable), appends each received prompt to STUB_LOG, and replies
 // "turn=<n> prev=<previous prompt> got=<prompt>". A prompt containing
-// "[stub:fail]" produces an error result instead of a reply.
+// "[stub:fail]" produces an error result instead of a reply; "[stub:slow]"
+// delays the turn's result by 2s so a test can queue a message behind it.
 package main
 
 import (
@@ -11,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 func emit(v any) {
@@ -47,6 +49,9 @@ func main() {
 		}
 		prompt, _ := in.Message.Content.(string)
 		logf(strings.ReplaceAll(prompt, "\n", "\\n"))
+		if strings.Contains(prompt, "[stub:slow]") {
+			time.Sleep(2 * time.Second)
+		}
 		if strings.Contains(prompt, "[stub:fail]") {
 			emit(map[string]any{"type": "result", "subtype": "error_during_execution", "is_error": true, "result": "stub failure", "session_id": sid})
 			continue
