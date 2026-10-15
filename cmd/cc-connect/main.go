@@ -692,6 +692,13 @@ func main() {
 			}
 		}
 
+		// First-event timeout (nibiru#836): default 300s, 0 disables.
+		firstEvt := 300
+		if cfg.FirstEventTimeoutSecs != nil {
+			firstEvt = *cfg.FirstEventTimeoutSecs
+		}
+		engine.SetFirstEventTimeout(time.Duration(firstEvt) * time.Second)
+
 		// Wire max turn time (absolute per-turn wall-clock cap; 0 = disabled)
 		if cfg.MaxTurnTimeMins != nil && *cfg.MaxTurnTimeMins > 0 {
 			engine.SetMaxTurnTime(time.Duration(*cfg.MaxTurnTimeMins) * time.Minute)
@@ -714,6 +721,7 @@ func main() {
 			}
 			engine.SetAutoCompressConfigWithSource(true, maxTokens, minGap, proj.AutoCompress.AllowHeuristic)
 		}
+		applyNibiruLifecycle(engine, proj.AutoCompress)
 		resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 		engine.SetResetOnIdle(resetIdle)
 		if defaulted {
@@ -1817,6 +1825,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	} else {
 		engine.SetAutoCompressConfig(false, 0, 0)
 	}
+	applyNibiruLifecycle(engine, proj.AutoCompress)
 	resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 	engine.SetResetOnIdle(resetIdle)
 	if defaulted {
@@ -2114,4 +2123,10 @@ func derefInt(v *int) int {
 		return 0
 	}
 	return *v
+}
+
+// applyNibiruLifecycle wires the percent-based compress and handoff rotation (nibiru#836).
+func applyNibiruLifecycle(engine *core.Engine, ac config.AutoCompressConfig) {
+	engine.SetCompressPercent(derefInt(ac.Percent))
+	engine.SetRotateConfig(derefInt(ac.RotatePercent), derefInt(ac.RotateMaxTokens))
 }
