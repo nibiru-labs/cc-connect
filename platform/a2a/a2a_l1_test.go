@@ -57,8 +57,13 @@ func (a *l1Acker) Track(k string, ids []string) {
 	}
 	a.tracked[k] = append(a.tracked[k], ids...)
 }
-func (a *l1Acker) TurnSucceeded(string)     { a.mu.Lock(); a.succeeded++; a.mu.Unlock() }
-func (a *l1Acker) TurnFailed(string, error) { a.mu.Lock(); a.failed++; a.mu.Unlock() }
+func (a *l1Acker) Admit(string) bool         { return true }
+func (a *l1Acker) TurnSucceededIDs([]string) { a.mu.Lock(); a.succeeded++; a.mu.Unlock() }
+func (a *l1Acker) TurnFailedIDs(string, []string, error) {
+	a.mu.Lock()
+	a.failed++
+	a.mu.Unlock()
+}
 
 func TestDispatchMapsAndDedups(t *testing.T) {
 	c := &l1Client{pending: []Inbound{{MessageID: "m1", ConversationID: "c1", SenderID: "dot", Text: "hi"}}}
@@ -267,3 +272,35 @@ func TestSendFailureDoesNotTouchAcker(t *testing.T) {
 }
 
 var _ core.TurnFinisher = (*Platform)(nil)
+
+// m2 is dispatched (and tracked) while m1's turn is still running on the same
+// session; FinishTurn for m1 must settle only m1.
+func TestFinishTurnSettlesOnlyOwnMessages(t *testing.T) {
+	for _, ok := range []bool{true, false} {
+		c := &l1Client{pending: []Inbound{
+			{MessageID: "m1", ConversationID: "c1", SenderID: "dot", Text: "a"},
+			{MessageID: "m2", ConversationID: "c1", SenderID: "dot", Text: "b"},
+		}}
+		acker := NewAcker(c, AckerConfig{DisableAckRetry: true})
+		p := newPlatform(c, acker, nil)
+		var got []*core.Message
+		p.pollOnce(context.Background(), func(_ core.Platform, m *core.Message) { got = append(got, m) })
+		if len(got) != 2 {
+			t.Fatalf("want 2 dispatches, got %d", len(got))
+		}
+		p.FinishTurn(context.Background(), got[0].ReplyCtx, ok)
+		if ok && (len(c.acked) != 1 || c.acked[0] != "m1") {
+			t.Fatalf("ok: want only m1 acked, got %v", c.acked)
+		}
+		if !ok && len(c.acked) != 0 {
+			t.Fatalf("fail: nothing may be acked, got %v", c.acked)
+		}
+		if acker.Admit("m2") {
+			t.Fatal("m2 must stay in flight")
+		}
+		p.FinishTurn(context.Background(), got[1].ReplyCtx, true)
+		if len(c.acked) == 0 || c.acked[len(c.acked)-1] != "m2" {
+			t.Fatalf("m2 must be acked by its own turn: %v", c.acked)
+		}
+	}
+}

@@ -35,18 +35,16 @@ type replyContext struct {
 }
 
 // Acker is implemented by L2 (ack.go).
+// Settlement is by the turn's own message IDs: a turn must never settle a
+// later message that is merely queued behind it on the same session.
 type Acker interface {
+	Admit(messageID string) bool
 	Track(sessionKey string, messageIDs []string)
-	TurnSucceeded(sessionKey string)
-	TurnFailed(sessionKey string, err error)
+	TurnSucceededIDs(messageIDs []string)
+	TurnFailedIDs(sessionKey string, messageIDs []string, err error)
 }
 
-// TODO(836-a2a-ack): replace with the real Acker from ack.go once merged.
-type noopAcker struct{}
-
-func (noopAcker) Track(string, []string)   {}
-func (noopAcker) TurnSucceeded(string)     {}
-func (noopAcker) TurnFailed(string, error) {}
+var _ Acker = (*DefaultAcker)(nil)
 
 // Platform is the A2A chat platform.
 type Platform struct {
@@ -72,7 +70,9 @@ type Platform struct {
 // poll_interval (seconds or Go duration), max_chunk (bytes).
 func New(opts map[string]any) (core.Platform, error) {
 	bin, _ := opts["a2a_bin"].(string)
-	p := newPlatform(newCLIClient(bin), noopAcker{}, opts)
+	c := newCLIClient(bin)
+	p := newPlatform(c, NewAcker(c, AckerConfig{}), opts)
+	p.pong = NewPongHandler(c, 0).Handle
 	return p, nil
 }
 
@@ -210,6 +210,11 @@ func (p *Platform) dispatch(ctx context.Context, handler core.MessageHandler, m 
 	p.inflight[m.MessageID] = true
 	p.mu.Unlock()
 
+	if !p.acker.Admit(m.MessageID) {
+		p.release(m.MessageID, false)
+		return
+	}
+
 	if p.pong != nil && p.pong(ctx, m) {
 		p.release(m.MessageID, true)
 		return
@@ -299,9 +304,9 @@ func (p *Platform) FinishTurn(_ context.Context, replyCtx any, ok bool) {
 	}
 	sessionKey := "a2a:" + rc.ConversationID
 	if ok {
-		p.acker.TurnSucceeded(sessionKey)
+		p.acker.TurnSucceededIDs(rc.MessageIDs)
 	} else {
-		p.acker.TurnFailed(sessionKey, fmt.Errorf("a2a: turn did not complete"))
+		p.acker.TurnFailedIDs(sessionKey, rc.MessageIDs, fmt.Errorf("a2a: turn did not complete"))
 	}
 	p.finish(rc, ok)
 }
