@@ -1,0 +1,39 @@
+# Example: ONE project, ONE agent session for DingTalk + WeChat + A2A (nibiru#966).
+# Replaces the separate `sakura` and `sakura-a2a` projects. Merge by hand into
+# ~/.cc-connect/config.toml (back it up first); secrets stay in the env files, never here.
+# All sources share one claude process; turns run strictly one at a time (extra
+# messages queue), each reply goes back to the platform/conversation it came from,
+# and every prompt is prefixed with a [cc-connect source platform=... sender_id=...
+# conversation=... msg_id=...] line. Lifecycle (idle reset, compress, rotation +
+# handoff summary via nibiru-steward) applies to the single session key `unified:<name>`.
+
+[[projects]]
+name = "sakura"
+unified_session = true
+reset_on_idle_mins = 480
+
+[projects.agent]
+type = "claudecode"
+
+[projects.agent.options]
+model = "sonnet"
+work_dir = "/Users/surlymo/workspace/nibiru"
+mode = "bypassPermissions"
+
+[projects.agent.options.env]
+NIBIRU_AGENT = "sakura"
+
+# DingTalk (options as in the existing sakura project; credentials from dingtalk.env).
+[[projects.platforms]]
+type = "dingtalk"
+
+[projects.platforms.options]
+# allow_from = "<merged dingtalk user ids, incl. cursor>"
+
+# WeChat: add the existing weixin/wecom platform block of the old `sakura` project here.
+
+[[projects.platforms]]
+type = "a2a"
+
+[projects.platforms.options]
+allow_from = "grok,dot,claude-cloud,hermes"

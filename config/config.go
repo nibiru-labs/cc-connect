@@ -532,7 +532,9 @@ type ProjectConfig struct {
 	ShowWorkdirIndicator *bool `toml:"show_workdir_indicator,omitempty"`
 	// ReplyFooter: nil/true = render the reply footer; false = disable it
 	// entirely (the per-line indicator flags above become no-ops).
-	ReplyFooter      *bool        `toml:"reply_footer,omitempty"`
+	ReplyFooter *bool `toml:"reply_footer,omitempty"`
+	// UnifiedSession (nibiru#966): all platforms/conversations of this project share one agent session.
+	UnifiedSession   bool         `toml:"unified_session,omitempty"`
 	InjectSender     *bool        `toml:"inject_sender,omitempty"`     // prepend sender identity (platform + user ID) to each message sent to the agent
 	DisabledCommands []string     `toml:"disabled_commands,omitempty"` // commands to disable for this project (e.g. ["restart", "upgrade"])
 	AdminFrom        string       `toml:"admin_from,omitempty"`        // comma-separated user IDs allowed to run privileged commands; "*" = all allowed users

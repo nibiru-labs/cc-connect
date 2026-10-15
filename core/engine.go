@@ -366,6 +366,7 @@ type Engine struct {
 	tts                   *TTSCfg
 	display               DisplayCfg
 	injectSender          bool
+	unifiedSession        bool // nibiru#966: all sources share one session key
 	attachmentSendEnabled bool
 	startedAt             time.Time
 
@@ -3061,6 +3062,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		}
 	}
 
+	// nibiru#966: merge every source into one session key (reply ctx stays per message).
+	e.applyUnifiedSession(msg)
+
 	// Multi-workspace resolution
 	var wsAgent Agent
 	var wsSessions *SessionManager
@@ -3183,6 +3187,10 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	if e.discardStaleUserMessageIfNeeded(interactiveKey, msg) {
 		return
 	}
+
+	// nibiru#966: label the source (platform/sender/conversation) for the model.
+	// After command/permission handling so slash commands stay untouched.
+	e.tagUnifiedSource(msg)
 
 	session := sessions.GetOrCreateActive(msg.SessionKey)
 	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
