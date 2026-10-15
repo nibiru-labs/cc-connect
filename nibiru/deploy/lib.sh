@@ -8,6 +8,8 @@ RUNNER_LABEL="com.nibiru.sakura-runner"
 CC_PLIST="$LA_DIR/$CC_LABEL.plist"
 RUNNER_PLIST="$LA_DIR/$RUNNER_LABEL.plist"
 CC_CONFIG="$HOME/.cc-connect/config.toml"
+# Pre-a2a config, written by the operator before merging the a2a project. Rollback restores it.
+CC_BASELINE="$CC_CONFIG.runner-baseline"
 BIN="$HOME/.local/nibiru/bin/cc-connect"
 STAMP="$(date +%Y%m%d%H%M%S)"
 DRY=0
@@ -28,9 +30,33 @@ run() {
   "$@"
 }
 
-# run_soft is run, but a failing command (e.g. bootout of a service that is not loaded) is not fatal.
-run_soft() {
-  printf '+ %s\n' "$*"
-  [ "$DRY" -eq 1 ] && return 0
-  "$@" || echo "  (ignored: exit $?)"
+# has_a2a FILE: succeeds if FILE declares an a2a platform (type = "a2a").
+has_a2a() {
+  grep -Eq "type[[:space:]]*=[[:space:]]*[\"']a2a[\"']" "$1"
+}
+
+# service_loaded LABEL: succeeds if launchd still has the service loaded.
+service_loaded() {
+  launchctl print "$DOMAIN/$1" >/dev/null 2>&1
+}
+
+# stop_service LABEL: bootout, then confirm the service is really unloaded.
+# Failures are never swallowed: a service that is still loaded is an error,
+# because starting its replacement would leave two consumers.
+stop_service() {
+  local label="$1"
+  if [ "$DRY" -eq 1 ]; then
+    run launchctl bootout "$DOMAIN/$label"
+    echo "+ confirm $label unloaded"
+    return 0
+  fi
+  if ! service_loaded "$label"; then
+    echo "  $label not loaded; nothing to stop"
+    return 0
+  fi
+  run launchctl bootout "$DOMAIN/$label" || { echo "bootout $label failed" >&2; return 1; }
+  if service_loaded "$label"; then
+    echo "refusing: $label is still loaded after bootout" >&2
+    return 1
+  fi
 }

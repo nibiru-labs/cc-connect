@@ -39,17 +39,25 @@ Merge it into `~/.cc-connect/config.toml` by hand (secrets stay in `~/.cc-connec
 
 Two things must never read the same A2A inbox: `com.nibiru.sakura-runner` (python runner) and cc-connect's a2a platform.
 
+Before merging the a2a project into `~/.cc-connect/config.toml`, save the pre-a2a config as the rollback baseline (it must NOT contain `type = "a2a"`):
+
 ```sh
-nibiru/deploy/switch-to-a2a.sh --dry-run      # always look first
-nibiru/deploy/switch-to-a2a.sh                # backup -> bootout runner -> reload cc-connect
-nibiru/deploy/rollback-to-runner.sh --dry-run
-nibiru/deploy/rollback-to-runner.sh           # restore config backup -> reload cc-connect -> bootstrap runner
+cp -p ~/.cc-connect/config.toml ~/.cc-connect/config.toml.runner-baseline
 ```
 
-Order matters and is enforced by the scripts: the old consumer is stopped before the new one starts.
-Both scripts back up config/plist (`*.bak-a2a-<ts>`) and support `--dry-run` (print commands only).
-`switch-to-a2a.sh` refuses to run if the config has no `type = "a2a"` platform or the binary is missing;
-`rollback-to-runner.sh` refuses without a `config.toml.bak-a2a-*` backup (hand-edit instead).
+```sh
+nibiru/deploy/switch-to-a2a.sh --dry-run      # always look first
+nibiru/deploy/switch-to-a2a.sh                # bootout runner (confirmed unloaded) -> reload cc-connect
+nibiru/deploy/rollback-to-runner.sh --dry-run
+nibiru/deploy/rollback-to-runner.sh           # confirm cc-connect unloaded -> restore baseline -> bootstrap cc-connect -> bootstrap runner
+```
+
+Order matters and is enforced by the scripts: the old consumer is confirmed unloaded before the new one starts.
+A failed bootout is never ignored; the script aborts and leaves the other consumer alone.
+`switch-to-a2a.sh` refuses to run if the config has no `type = "a2a"` platform, the baseline is missing or
+already contains a2a, or the binary is missing. `rollback-to-runner.sh` refuses without a baseline that
+contains no a2a platform, and refuses if the runner is already loaded.
+Both scripts support `--dry-run` (print commands only). `switch-to-a2a.sh` keeps `*.bak-a2a-<ts>` backups of the config and plist.
 The plists are only read, never modified.
 
 ## Tests
