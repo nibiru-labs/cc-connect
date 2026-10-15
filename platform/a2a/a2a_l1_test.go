@@ -98,7 +98,7 @@ func TestNonRosterAckedAndDropped(t *testing.T) {
 func TestPongHookConsumes(t *testing.T) {
 	c := &l1Client{pending: []Inbound{{MessageID: "m1", ConversationID: "c1", SenderID: "claude-cloud", Text: "ping"}}}
 	p := newPlatform(c, &l1Acker{}, nil)
-	p.pong = func(context.Context, Inbound) bool { return true }
+	p.pong = func(context.Context, Inbound) (bool, bool) { return true, true }
 	n := 0
 	p.pollOnce(context.Background(), func(core.Platform, *core.Message) { n++ })
 	if n != 0 {
