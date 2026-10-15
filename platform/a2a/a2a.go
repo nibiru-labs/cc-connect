@@ -55,8 +55,8 @@ type Platform struct {
 	maxChunk int
 
 	// pong answers liveness pings at platform level and reports whether the
-	// message was consumed (pong.go); nil = not handled.
-	pong func(ctx context.Context, m Inbound) bool
+	// message was consumed. TODO(836-a2a-ack): wire to pong.go; nil = not handled.
+	pong func(ctx context.Context, m Inbound) (consumed, settled bool)
 
 	mu       sync.Mutex
 	inflight map[string]bool
@@ -72,7 +72,7 @@ func New(opts map[string]any) (core.Platform, error) {
 	bin, _ := opts["a2a_bin"].(string)
 	c := newCLIClient(bin)
 	p := newPlatform(c, NewAcker(c, AckerConfig{}), opts)
-	p.pong = NewPongHandler(c, 0).Handle
+	p.pong = NewPongHandler(c, 0).HandleSettled
 	return p, nil
 }
 
@@ -117,14 +117,10 @@ func newPlatform(c Client, a Acker, opts map[string]any) *Platform {
 	if maxChunk < 64 {
 		maxChunk = defaultMaxChunk
 	}
-	pl := &Platform{
+	return &Platform{
 		client: c, acker: a, allow: allow, interval: interval, maxChunk: maxChunk,
 		inflight: map[string]bool{}, done: map[string]time.Time{}, replies: map[string]int{},
 	}
-	if c != nil {
-		pl.pong = NewPongHandler(c, 0).Handle
-	}
-	return pl
 }
 
 func (p *Platform) Name() string { return "a2a" }
@@ -202,13 +198,6 @@ func (p *Platform) dispatch(ctx context.Context, handler core.MessageHandler, m 
 	if m.MessageID == "" {
 		return
 	}
-	// The Acker may hold a message back (turn in progress, retry backoff,
-	// pending ack retry); pings and roster drops below are not tracked by it.
-	if _, isPing := PingRequestID(m.Text); !isPing {
-		if ad, ok := p.acker.(interface{ Admit(string) bool }); ok && !ad.Admit(m.MessageID) {
-			return
-		}
-	}
 	p.mu.Lock()
 	if p.inflight[m.MessageID] {
 		p.mu.Unlock()
@@ -226,9 +215,13 @@ func (p *Platform) dispatch(ctx context.Context, handler core.MessageHandler, m 
 		return
 	}
 
-	if p.pong != nil && p.pong(ctx, m) {
-		p.release(m.MessageID, true)
-		return
+	if p.pong != nil {
+		if consumed, settled := p.pong(ctx, m); consumed {
+			// Only a terminal (acked) ping is remembered as done; a failed pong
+			// send or ack must stay retryable on the next poll round.
+			p.release(m.MessageID, settled)
+			return
+		}
 	}
 	if !p.allow[strings.ToLower(m.SenderID)] {
 		slog.Warn("a2a: dropping message from non-roster sender", "sender", m.SenderID, "message_id", m.MessageID)
