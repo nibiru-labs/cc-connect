@@ -416,6 +416,8 @@ type Engine struct {
 	eventIdleTimeout    time.Duration
 	staleLockBreakAfter time.Duration // busy-lock stale-break threshold; 0 disables
 	maxTurnTime         time.Duration // absolute wall-clock cap per turn (0 = disabled)
+	lifecycle           nibiruLifecycle // rotate/compress-by-percent settings; nibiru#836
+	firstEventTimeout   time.Duration // max wait for the first agent event of a turn (0 = disabled); nibiru#836
 	// agentSessionIdleTimeoutNanos 在单轮正常结束后关闭空闲的 live agent 进程，
 	// 同时保留已保存的 session ID，便于下次继续恢复。
 	agentSessionIdleTimeoutNanos atomic.Int64
@@ -1413,6 +1415,13 @@ func (e *Engine) SetMaxTurnTime(d time.Duration) {
 // agent process before the next incoming message breaks it. 0 disables.
 func (e *Engine) SetStaleLockBreakAfter(d time.Duration) {
 	e.staleLockBreakAfter = d
+}
+
+// SetFirstEventTimeout sets the maximum time to wait for the first agent event after
+// a prompt is sent. It catches agents that start but never answer (e.g. a logged-out
+// claude whose error output was drained as stale). 0 disables it. nibiru#836
+func (e *Engine) SetFirstEventTimeout(d time.Duration) {
+	e.firstEventTimeout = d
 }
 
 // SetEventIdleTimeout sets the maximum time to wait between consecutive agent events.
@@ -4049,6 +4058,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 
 	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+	promptContent, ackHandoff := e.withHandoff(interactiveKey, promptContent) // nibiru#836
 
 	sendStart := time.Now()
 	state.mu.Lock()
@@ -4067,7 +4077,11 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			sendDone <- fmt.Errorf("agent session became nil")
 			return
 		}
-		sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
+		err := as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
+		if err == nil {
+			ackHandoff() // nibiru#836: keep the handoff when the send fails
+		}
+		sendDone <- err
 	}()
 
 	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
@@ -5202,6 +5216,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	var cardMessageID any
 	var partialText string
 	triggerAutoCompress := false
+	triggerRotate := false
 	pendingSend := sendDone
 
 	// stopTyping tracks the current turn's typing indicator so it can be
@@ -5287,6 +5302,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		idleCh = idleTimer.C
 	}
 
+	// First-event timeout: fails the turn fast when the agent never produces any event.
+	var firstEventCh <-chan time.Time
+	var firstEventTimer *time.Timer
+	if e.firstEventTimeout > 0 {
+		firstEventTimer = time.NewTimer(e.firstEventTimeout)
+		defer firstEventTimer.Stop()
+		firstEventCh = firstEventTimer.C
+	}
+
 	// Max turn time: absolute wall-clock cap that does NOT reset on events.
 	// Prevents long-running tool calls from blocking the session forever (#1091).
 	var turnDeadlineCh <-chan time.Time
@@ -5310,6 +5334,23 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if !ok {
 				goto channelClosed
 			}
+			firstEventCh = nil
+		case <-firstEventCh:
+			slog.Error("agent produced no event after prompt: killing session",
+				"session_key", sessionKey, "timeout", e.firstEventTimeout)
+			cp.Finalize(ProgressCardStateFailed)
+			sp.discard()
+			if stopTyping != nil {
+				stopTyping()
+				stopTyping = nil
+			}
+			state.mu.Lock()
+			state.eventsNeedResync = true
+			p := state.platform
+			state.mu.Unlock()
+			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent did not respond (possibly logged out or crashed); session reset, please resend"))
+			e.cleanupInteractiveState(sessionKey, state)
+			return
 		case err := <-pendingSend:
 			pendingSend = nil
 			if err != nil {
@@ -6027,6 +6068,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			contextEstimate := estimateTokensWithPendingAssistant(session.GetHistory(0), baseResponse)
 
+			// nibiru#836: rotate on exact usage, independent of auto-compress.
+			if ru, hasRU := replyFooterContextUsage(state.agentSession); hasRU && e.shouldRotate(ru) {
+				triggerRotate = true
+			}
+
 			// Evaluate auto-compress trigger.
 			//
 			// Prefer the agent's actual API-reported input tokens when the session
@@ -6083,7 +6129,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				// dropping context still in use, or never compacts at all.
 				decidable := estimateSource == "exact" || !hasReporter || e.autoCompressAllowHeuristic
 				if decidable {
-					triggered := estimate >= e.autoCompressMaxTokens &&
+					compressAt := e.autoCompressMaxTokens
+					if estimateSource == "exact" && usage != nil && usage.ContextWindow > 0 && e.lifecycle.compressPercent > 0 {
+						compressAt = usage.ContextWindow * e.lifecycle.compressPercent / 100 // nibiru#836
+					}
+					triggered := estimate >= compressAt &&
 						(last.IsZero() || now.Sub(last) >= e.autoCompressMinGap)
 					slog.Info("auto-compress: decision",
 						"estimate", estimate,
@@ -6371,6 +6421,18 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			} else {
 				slog.Debug("tts: not enabled", "tts_nil", e.tts == nil, "enabled", e.tts != nil && e.tts.Enabled, "tts_obj_nil", e.tts == nil || e.tts.TTS == nil)
+			}
+
+			// nibiru#836: rotate with a handoff summary when context is nearly full.
+			if triggerRotate {
+				if pendingSend != nil {
+					if err := <-pendingSend; err != nil {
+						slog.Debug("async send error before rotate", "error", err)
+					}
+				}
+				if e.runRotate(state, session, sessions, sessionKey, state.platform, state.replyCtx, lockGen) {
+					return
+				}
 			}
 
 			// Auto-compress after finishing a turn, before sending any queued messages.

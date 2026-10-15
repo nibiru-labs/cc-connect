@@ -510,6 +510,16 @@ func (cs *CronScheduler) Start() error {
 	jobs := cs.store.List()
 	for _, job := range jobs {
 		if job.Enabled {
+			// nibiru#836: do not schedule jobs bound to a platform that is not
+			// configured; they could only fail on every run.
+			cs.mu.RLock()
+			eng := cs.engines[job.Project]
+			cs.mu.RUnlock()
+			if eng != nil && job.SessionKey != "" && !eng.HasPlatformForSession(job.SessionKey) {
+				slog.Error("cron: job bound to an unconfigured platform, not scheduled — rebind or disable it",
+					"id", job.ID, "project", job.Project, "session_key", job.SessionKey)
+				continue
+			}
 			if err := cs.scheduleJob(job); err != nil {
 				slog.Warn("cron: failed to schedule job", "id", job.ID, "error", err)
 			}

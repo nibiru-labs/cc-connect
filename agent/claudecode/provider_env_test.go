@@ -401,3 +401,36 @@ func TestDetectEnvOnlyProviderType(t *testing.T) {
 		}
 	}
 }
+
+// nibiru#836：项目级 [projects.agent.options.env] 里只有模型选择 / 非供应商变量时，
+// 不得注入 CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST，否则官方 claude 忽略 /login，直接报 Not logged in。
+func TestRuntimeEnv_ModelOnlyConfigEnvDoesNotInjectHostManagedFlag(t *testing.T) {
+	a := &Agent{
+		configEnv: []string{
+			"NIBIRU_AGENT=sakura",
+			"CLAUDE_CODE_SUBAGENT_MODEL=haiku",
+			"ANTHROPIC_MODEL=claude-haiku-5-5",
+		},
+		activeIdx: -1,
+	}
+
+	env := envSliceToMap(a.runtimeEnvLocked())
+	if _, ok := env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"]; ok {
+		t.Fatalf("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST unexpectedly set for model-only config env: %v", env)
+	}
+}
+
+func TestRuntimeEnv_RoutingConfigEnvStillInjectsHostManagedFlag(t *testing.T) {
+	a := &Agent{
+		configEnv: []string{
+			"CLAUDE_CODE_SUBAGENT_MODEL=haiku",
+			"ANTHROPIC_BASE_URL=https://example.com/v1",
+		},
+		activeIdx: -1,
+	}
+
+	env := envSliceToMap(a.runtimeEnvLocked())
+	if got := env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"]; got != "1" {
+		t.Fatalf("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = %q, want 1 when routing var is configured", got)
+	}
+}
