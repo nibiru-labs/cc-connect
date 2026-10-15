@@ -68,6 +68,15 @@ has_a2a "$HOME/.cc-connect/config.toml" && ok "has_a2a: detects a2a" || bad "has
 printf '%s' "$CLEAN_CFG" > "$HOME/.cc-connect/clean.toml"
 has_a2a "$HOME/.cc-connect/clean.toml" && bad "has_a2a: clean config" || ok "has_a2a: clean config"
 
+# stop_service: tolerate launchd's asynchronous unload (N6 2026-10-16), fail if it never unloads
+launchctl() { :; }                      # bootout is a no-op in the test
+DRY=0; STOP_WAIT_INTERVAL=0; STOP_WAIT_TRIES=5
+n=0; service_loaded() { n=$((n+1)); [ "$n" -le 3 ]; }   # loaded for 3 checks, then gone
+stop_service svc >/dev/null 2>&1 && ok "stop_service: waits for late unload" || bad "stop_service: waits for late unload"
+service_loaded() { return 0; }          # never unloads
+stop_service svc >/dev/null 2>&1 && bad "stop_service: fails when still loaded" || ok "stop_service: fails when still loaded"
+unset -f launchctl
+
 for s in build switch-to-a2a rollback-to-runner; do
   "$D/$s.sh" --bogus >/dev/null 2>&1 && bad "$s: accepts bogus flag" || ok "$s: rejects bogus flag"
 done

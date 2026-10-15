@@ -55,8 +55,13 @@ stop_service() {
     return 0
   fi
   run launchctl bootout "$DOMAIN/$label" || { echo "bootout $label failed" >&2; return 1; }
-  if service_loaded "$label"; then
-    echo "refusing: $label is still loaded after bootout" >&2
-    return 1
-  fi
+  # launchd unloads asynchronously: poll briefly before declaring failure
+  # (N6 on 2026-10-16: the first check ran too early and aborted twice).
+  local i
+  for i in $(seq 1 "${STOP_WAIT_TRIES:-10}"); do
+    service_loaded "$label" || return 0
+    sleep "${STOP_WAIT_INTERVAL:-1}"
+  done
+  echo "refusing: $label is still loaded after bootout" >&2
+  return 1
 }
