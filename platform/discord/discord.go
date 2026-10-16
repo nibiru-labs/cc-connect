@@ -902,8 +902,9 @@ func (p *Platform) handleComponentInteraction(s *discordgo.Session, i *discordgo
 	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
 		Data: &discordgo.InteractionResponseData{
-			Content:    origText + "\n\n> " + command,
-			Components: emptyComponents,
+			Content:         origText + "\n\n> " + command,
+			Components:      emptyComponents,
+			AllowedMentions: noDiscordMentions(),
 		},
 	}); err != nil {
 		slog.Debug("discord: command component update failed", "error", err)
@@ -973,6 +974,12 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	}
 }
 
+// noDiscordMentions keeps untrusted agent text visible without triggering Discord pings.
+// Use a fresh value for each request rather than sharing mutable slices across sends.
+func noDiscordMentions() *discordgo.MessageAllowedMentions {
+	return &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}, RepliedUser: false}
+}
+
 // sendInteraction delivers a message through the Discord interaction response
 // mechanism. The first call edits the deferred "thinking" response; subsequent
 // calls create followup messages.
@@ -989,14 +996,14 @@ func (p *Platform) sendInteraction(ictx *interactionReplyCtx, content string) er
 		var err error
 		if first {
 			c := chunk
-			_, err = p.session.InteractionResponseEdit(ictx.interaction, &discordgo.WebhookEdit{Content: &c})
+			_, err = p.session.InteractionResponseEdit(ictx.interaction, &discordgo.WebhookEdit{Content: &c, AllowedMentions: noDiscordMentions()})
 		} else {
-			_, err = p.session.FollowupMessageCreate(ictx.interaction, true, &discordgo.WebhookParams{Content: chunk})
+			_, err = p.session.FollowupMessageCreate(ictx.interaction, true, &discordgo.WebhookParams{Content: chunk, AllowedMentions: noDiscordMentions()})
 		}
 
 		if err != nil {
 			slog.Warn("discord: interaction response failed, falling back to channel message", "error", err)
-			_, err = p.session.ChannelMessageSend(ictx.channelID, chunk)
+			_, err = p.session.ChannelMessageSendComplex(ictx.channelID, &discordgo.MessageSend{Content: chunk, AllowedMentions: noDiscordMentions()})
 			if err != nil {
 				return fmt.Errorf("discord: send fallback: %w", err)
 			}
@@ -1010,10 +1017,10 @@ func (p *Platform) sendChannelReply(rc replyContext, content string) error {
 	for _, chunk := range chunks {
 		var err error
 		if rc.useThreadChannel() || rc.messageID == "" {
-			_, err = p.session.ChannelMessageSend(rc.targetChannelID(), chunk)
+			_, err = p.session.ChannelMessageSendComplex(rc.targetChannelID(), &discordgo.MessageSend{Content: chunk, AllowedMentions: noDiscordMentions()})
 		} else {
 			ref := &discordgo.MessageReference{MessageID: rc.messageID}
-			_, err = p.session.ChannelMessageSendReply(rc.channelID, chunk, ref)
+			_, err = p.session.ChannelMessageSendComplex(rc.channelID, &discordgo.MessageSend{Content: chunk, Reference: ref, AllowedMentions: noDiscordMentions()})
 		}
 		if err != nil {
 			return fmt.Errorf("discord: send: %w", err)
@@ -1025,7 +1032,7 @@ func (p *Platform) sendChannelReply(rc replyContext, content string) error {
 func (p *Platform) sendChannel(rc replyContext, content string) error {
 	chunks := core.SplitMessageCodeFenceAware(wrapTablesInCodeBlocks(content), maxDiscordLen)
 	for _, chunk := range chunks {
-		_, err := p.session.ChannelMessageSend(rc.targetChannelID(), chunk)
+		_, err := p.session.ChannelMessageSendComplex(rc.targetChannelID(), &discordgo.MessageSend{Content: chunk, AllowedMentions: noDiscordMentions()})
 		if err != nil {
 			return fmt.Errorf("discord: send: %w", err)
 		}
@@ -1190,8 +1197,9 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 			return err
 		}
 		_, err := p.session.FollowupMessageCreate(rc.interaction, true, &discordgo.WebhookParams{
-			Content:    content,
-			Components: components,
+			Content:         content,
+			Components:      components,
+			AllowedMentions: noDiscordMentions(),
 		})
 		if err != nil {
 			return fmt.Errorf("discord: send button followup: %w", err)
@@ -1199,8 +1207,9 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 		return nil
 	case replyContext:
 		_, err := p.session.ChannelMessageSendComplex(rc.targetChannelID(), &discordgo.MessageSend{
-			Content:    content,
-			Components: components,
+			Content:         content,
+			Components:      components,
+			AllowedMentions: noDiscordMentions(),
 		})
 		if err != nil {
 			return fmt.Errorf("discord: send channel buttons: %w", err)
