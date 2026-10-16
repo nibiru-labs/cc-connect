@@ -178,10 +178,15 @@ type appServerSession struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	stateMu      sync.Mutex
-	pendingMsgs  []string
-	currentTurn  string
-	preambleSent bool
+	stateMu          sync.Mutex
+	pendingMsgs      []string
+	currentTurn      string
+	turnStartedAt    time.Time
+	runtimeEpoch     uint64
+	runtimeClosed    bool
+	lastFinishedTurn string
+	runtimeWaiting   map[string]string
+	preambleSent     bool
 
 	runtimeMu sync.RWMutex
 	usage     *core.UsageReport
@@ -525,6 +530,9 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 		params["approvalPolicy"] = approval
 	}
 
+	s.stateMu.Lock()
+	startEpoch := s.runtimeEpoch
+	s.stateMu.Unlock()
 	var resp turnStartResponse
 	if err := s.request("turn/start", params, &resp); err != nil {
 		return fmt.Errorf("codex app-server turn/start: %w", err)
@@ -533,10 +541,7 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 		return fmt.Errorf("codex app-server turn/start returned empty turn id")
 	}
 
-	s.stateMu.Lock()
-	s.currentTurn = resp.Turn.ID
-	s.pendingMsgs = s.pendingMsgs[:0]
-	s.stateMu.Unlock()
+	s.recordTurnStartResponse(resp.Turn.ID, startEpoch)
 
 	return nil
 }
@@ -636,6 +641,7 @@ func (s *appServerSession) handleApprovalRequest(rawID json.RawMessage, method s
 	s.approvalsMu.Lock()
 	s.pendingApprovals[requestID] = ch
 	s.approvalsMu.Unlock()
+	s.setRuntimeWaiting(requestID, true)
 
 	s.flushPendingAsThinking()
 	s.emit(core.Event{
@@ -660,6 +666,7 @@ func (s *appServerSession) handleApprovalRequest(rawID json.RawMessage, method s
 		s.approvalsMu.Lock()
 		delete(s.pendingApprovals, requestID)
 		s.approvalsMu.Unlock()
+		s.setRuntimeWaiting(requestID, false)
 
 		decision := "decline"
 		if strings.EqualFold(result.Behavior, "allow") {
@@ -683,6 +690,7 @@ func (s *appServerSession) handlePermissionsApproval(rawID json.RawMessage, para
 	s.approvalsMu.Lock()
 	s.pendingApprovals[requestID] = ch
 	s.approvalsMu.Unlock()
+	s.setRuntimeWaiting(requestID, true)
 
 	s.flushPendingAsThinking()
 	s.emit(core.Event{
@@ -707,6 +715,7 @@ func (s *appServerSession) handlePermissionsApproval(rawID json.RawMessage, para
 		s.approvalsMu.Lock()
 		delete(s.pendingApprovals, requestID)
 		s.approvalsMu.Unlock()
+		s.setRuntimeWaiting(requestID, false)
 
 		if strings.EqualFold(result.Behavior, "allow") {
 			perms := params["permissions"]
@@ -751,6 +760,7 @@ func (s *appServerSession) handleRequestUserInput(rawID json.RawMessage, paramsR
 	s.approvalsMu.Lock()
 	s.pendingApprovals[requestID] = ch
 	s.approvalsMu.Unlock()
+	s.setRuntimeWaiting(requestID, true)
 
 	s.flushPendingAsThinking()
 	s.emit(core.Event{
@@ -776,6 +786,7 @@ func (s *appServerSession) handleRequestUserInput(rawID json.RawMessage, paramsR
 		s.approvalsMu.Lock()
 		delete(s.pendingApprovals, requestID)
 		s.approvalsMu.Unlock()
+		s.setRuntimeWaiting(requestID, false)
 
 		response := appServerRequestUserInputResponseFromResult(params.Questions, result)
 		_ = s.writeJSON(map[string]any{
@@ -968,7 +979,7 @@ func (s *appServerSession) Alive() bool {
 }
 
 func (s *appServerSession) Close() error {
-	s.alive.Store(false)
+	s.markRuntimeClosed()
 	s.cancel()
 
 	s.procMu.Lock()
@@ -1058,13 +1069,13 @@ func (s *appServerSession) readLoop(r io.Reader) {
 				s.emitError(fmt.Errorf("codex app-server connection closed: %w", err))
 			}
 		}
-		s.alive.Store(false)
+		s.markRuntimeClosed()
 		s.rejectPending(err)
 		s.rejectPendingApprovals(err)
 		return
 	}
 
-	s.alive.Store(false)
+	s.markRuntimeClosed()
 	s.rejectPending(io.EOF)
 	s.rejectPendingApprovals(io.EOF)
 }
@@ -1101,7 +1112,7 @@ func (s *appServerSession) waitLoop() {
 		slog.Warn("codex app-server exited unexpectedly", "error", err)
 		s.emitError(fmt.Errorf("codex app-server exited: %w", err))
 	}
-	s.alive.Store(false)
+	s.markRuntimeClosed()
 	if err == nil {
 		err = io.EOF
 	}
@@ -1134,9 +1145,11 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 	case "turn/started":
 		var notif turnNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+			if notif.ThreadID != "" && s.CurrentSessionID() != "" && notif.ThreadID != s.CurrentSessionID() {
+				return
+			}
 			s.stateMu.Lock()
-			s.currentTurn = notif.Turn.ID
-			s.pendingMsgs = s.pendingMsgs[:0]
+			s.startTurnLocked(notif.Turn.ID)
 			s.stateMu.Unlock()
 			s.storeContextUsage(nil)
 		}
@@ -1156,6 +1169,9 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 	case "turn/completed":
 		var notif turnNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+			if notif.ThreadID != "" && s.CurrentSessionID() != "" && notif.ThreadID != s.CurrentSessionID() {
+				return
+			}
 			if strings.EqualFold(strings.TrimSpace(notif.Turn.Status), "failed") || notif.Turn.Error != nil {
 				errMsg := ""
 				if notif.Turn.Error != nil {
@@ -1164,9 +1180,9 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 				if errMsg == "" {
 					errMsg = "turn failed (no details)"
 				}
-				s.failTurn(fmt.Errorf("%s", errMsg))
+				s.failTurn(fmt.Errorf("%s", errMsg), notif.Turn.ID)
 			} else {
-				s.completeTurn()
+				s.completeTurn(notif.Turn.ID)
 			}
 		}
 
@@ -1179,6 +1195,9 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 		}
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil && notif.Status.Type == "idle" {
 			// In codex 0.125+, thread going idle signals turn completion.
+			if notif.ThreadID != "" && s.CurrentSessionID() != "" && notif.ThreadID != s.CurrentSessionID() {
+				return
+			}
 			s.completeTurn()
 		}
 
@@ -1549,25 +1568,31 @@ func rpcIDToInt64(v any) (int64, bool) {
 	return 0, false
 }
 
-func (s *appServerSession) completeTurn() {
+func (s *appServerSession) completeTurn(ids ...string) {
+	id := ""
+	if len(ids) > 0 {
+		id = ids[0]
+	}
 	s.stateMu.Lock()
-	if s.currentTurn == "" {
+	if !s.finishTurnLocked(id) {
 		s.stateMu.Unlock()
 		return
 	}
-	s.currentTurn = ""
 	s.stateMu.Unlock()
 	s.flushPendingAsText()
 	s.emit(core.Event{Type: core.EventResult, SessionID: s.CurrentSessionID(), Done: true})
 }
 
-func (s *appServerSession) failTurn(err error) {
+func (s *appServerSession) failTurn(err error, ids ...string) {
+	id := ""
+	if len(ids) > 0 {
+		id = ids[0]
+	}
 	s.stateMu.Lock()
-	if s.currentTurn == "" {
+	if !s.finishTurnLocked(id) {
 		s.stateMu.Unlock()
 		return
 	}
-	s.currentTurn = ""
 	s.pendingMsgs = s.pendingMsgs[:0]
 	s.stateMu.Unlock()
 	s.emitError(err)
@@ -1728,7 +1753,7 @@ func (s *appServerSession) contextErr() error {
 }
 
 func (s *appServerSession) abortTransport() {
-	s.alive.Store(false)
+	s.markRuntimeClosed()
 	if s.cancel != nil {
 		s.cancel()
 	}
