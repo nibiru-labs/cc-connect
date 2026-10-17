@@ -7694,6 +7694,7 @@ func TestAgentSessionIdleTimeout_StaleTokenDoesNotCloseSession(t *testing.T) {
 	state := &interactiveState{
 		agentSession:           sess,
 		eventsNeedResync:       false,
+		unsolicitedTurnActive:  true,
 		agentSessionIdleToken:  2,
 		agentSessionIdleCancel: func() {},
 	}
@@ -7715,6 +7716,42 @@ func TestAgentSessionIdleTimeout_StaleTokenDoesNotCloseSession(t *testing.T) {
 	e.interactiveMu.Unlock()
 	if current != state {
 		t.Fatal("expected stale idle token to leave interactive state in place")
+	}
+	state.mu.Lock()
+	turnActive := state.unsolicitedTurnActive
+	state.mu.Unlock()
+	if !turnActive {
+		t.Fatal("stale idle token cleared the active marker for the current turn")
+	}
+}
+
+func TestAgentSessionIdleTimeout_ActiveUnsolicitedTurnSkipsCleanup(t *testing.T) {
+	e := newTestEngine()
+	key := "test:user1"
+	sess := newControllableSession("active-turn")
+	state := &interactiveState{
+		agentSession:          sess,
+		eventsNeedResync:      false,
+		unsolicitedTurnActive: true,
+		agentSessionIdleToken: 7,
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	e.cleanupInteractiveStateForIdleToken(key, state, 7, 20*time.Millisecond)
+
+	select {
+	case <-sess.closed:
+		t.Fatal("idle timeout cleanup closed a session with an active unsolicited turn")
+	default:
+	}
+	state.mu.Lock()
+	agentSession := state.agentSession
+	turnActive := state.unsolicitedTurnActive
+	state.mu.Unlock()
+	if agentSession != sess || !turnActive {
+		t.Fatal("idle timeout cleanup changed the active session state")
 	}
 }
 
@@ -14417,12 +14454,8 @@ func TestUnsolicitedReader_RelaysEventResult(t *testing.T) {
 	}
 }
 
-// TestUnsolicitedReader_ResetsIdleCloseOnEventResult verifies the P1-C P1-1
-// fix: an unsolicited EventResult must re-arm the per-session idle close
-// timer. Before the fix, the idle timer was only scheduled at the end of
-// the last foreground turn, so a long-running background turn (background
-// task that takes longer than the idle timeout) would be killed mid-flight
-// when the original timer fired.
+// TestUnsolicitedReader_ResetsIdleCloseOnEventResult verifies that a clean
+// unsolicited EventResult re-arms the per-session idle close timer.
 func TestUnsolicitedReader_ResetsIdleCloseOnEventResult(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	sess := newControllableSession("unsol-idle-reset")
@@ -14630,6 +14663,26 @@ func TestUnsolicitedReader_ReaderStartedBeforeIdleScheduleDoesNotArmDuringTurn(t
 	case <-sess.closed:
 	case <-time.After(2 * idleTimeout):
 		t.Fatal("fresh idle timeout did not close the now-idle session")
+	}
+}
+
+func TestUnsolicitedReader_StaleReaderCannotChangeCurrentTurnMarker(t *testing.T) {
+	e := newTestEngine()
+	state := &interactiveState{
+		agentSession:                newControllableSession("current"),
+		unsolicitedReaderGeneration: 2,
+		unsolicitedTurnActive:       true,
+	}
+
+	if e.beginUnsolicitedTurn(state, 1) {
+		t.Fatal("stale reader began a turn on the current reader generation")
+	}
+	e.finishUnsolicitedTurn(state, 1)
+	state.mu.Lock()
+	turnActive := state.unsolicitedTurnActive
+	state.mu.Unlock()
+	if !turnActive {
+		t.Fatal("stale reader cleared the active marker for the current turn")
 	}
 }
 
