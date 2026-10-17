@@ -4,7 +4,7 @@
 
 ## 源码与构建可复核
 
-1. 仅检出已精确审查的 **backport head**，运行 `python3 tools/runtime_snapshot_source_guard.py`。它检查除明确 runtime/spec/本说明/守卫外的全部安装基线 tracked 文件原样保留，并逐字节核 runtime 文件来自 PR16 `8bc232f`。不从 main 复制整树。
+1. 仅检出已精确审查的 **backport head**，运行 `python3 tools/runtime_snapshot_source_guard.py`。它检查除原有 12 路径 allowlist 外的安装基线 tracked 文件原样保留，拒绝未知路径，并要求 clean tree。七个 runtime 文件逐字节来自 PR16 合并提交 `efad8d569ca3426b24fcdab6a3b7dbfe00f88bf6`；`core/engine.go` 必须匹配 PR20 `9540a1b` 基础加 PR16 relay lifecycle 增量的固定组合 blob，`core/engine_test.go` 仍匹配 PR20 blob `71de554a`。不要整文件复制 engine，也不从 main 复制整树。
 2. 用 root 白名单核验现场二进制的 Go buildinfo：只取 Go toolchain、GOOS、GOARCH、CGO_ENABLED、build tags、vcs.revision、vcs.modified。不打印 ldflags、配置、环境或凭据。核现架构与原编译功能后选择相同目标及必要 tags；不得添加 `no_a2a` / `no_codex`。默认构建包含两插件。Makefile 的平台列表不列 a2a，不能把筛选变量当精确白名单。
 3. 在隔离 checkout 构建到 **工作目录外的候选路径**。不运行 `nibiru/deploy/build.sh`：它会替换安装路径。以该项目既有 `no_web` 纯 Go 配方举例（root 须先核现场 tags；这不是默认删减功能的许可）：
 

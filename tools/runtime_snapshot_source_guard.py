@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 
 BASE = "1ffc86d604eaf48fbcb5d2b000971d2222a1092d"
-RUNTIME_SOURCE = "8bc232f6577a8178a42eedd51ab153c6692c20f5"
+RUNTIME_SOURCE = "efad8d569ca3426b24fcdab6a3b7dbfe00f88bf6"
 RUNTIME_FILES = {
     "agent/codex/appserver_session.go",
     "agent/codex/runtime_snapshot.go",
@@ -15,10 +15,12 @@ RUNTIME_FILES = {
     "core/runtime_snapshot_test.go",
     "docs/runtime-snapshot.md",
 }
-INTEGRATED_SOURCE_COMMIT = "9540a1b087dc19b423606ecaae11052d0ca8a197"
+INTEGRATED_SOURCE_BASE_COMMIT = "9540a1b087dc19b423606ecaae11052d0ca8a197"
 INTEGRATED_SOURCE_BLOBS = {
-    # Pin the two already-reviewed idle/unsolicited-turn integration paths.
-    "core/engine.go": "ed5cbe102203a0bf49735e86b2cc0157b82ddb3a",
+    # Pin PR20's engine plus only PR16's relay inventory lifecycle delta.
+    # Do not replace this combined file with either source file wholesale.
+    "core/engine.go": "c2ebd39192daaac11aac3a13e40dd1ada03b6ef9",
+    # The engine test remains byte-identical to the reviewed PR20 source.
     "core/engine_test.go": "71de554a5860c3df1a7146c27acf7fb59227e764",
 }
 ALLOWED = RUNTIME_FILES | set(INTEGRATED_SOURCE_BLOBS) | {
@@ -44,9 +46,15 @@ def main():
     for path, expected_blob in sorted(INTEGRATED_SOURCE_BLOBS.items()):
         actual_blob = git("rev-parse", "HEAD:" + path).decode().strip()
         if actual_blob != expected_blob:
+            composition = (
+                "PR20 base " + INTEGRATED_SOURCE_BASE_COMMIT
+                + " plus PR16 relay delta " + RUNTIME_SOURCE
+                if path == "core/engine.go"
+                else "PR20 source " + INTEGRATED_SOURCE_BASE_COMMIT
+            )
             raise SystemExit(
-                "Integrated source differs from reviewed source "
-                + INTEGRATED_SOURCE_COMMIT
+                "Integrated source differs from pinned composition "
+                + composition
                 + ": "
                 + path
             )
