@@ -410,29 +410,31 @@ func TestRuntimeEndpointConcurrentRelaySnapshotsDoNotLeak(t *testing.T) {
 	const readers = 8
 	const samples = 20
 	start := make(chan struct{})
-	errs := make(chan error, readers*samples)
+	workerErrors := make([][]error, readers)
 	var wg sync.WaitGroup
 	for i := 0; i < readers; i++ {
 		wg.Add(1)
-		go func() {
+		go func(worker int) {
 			defer wg.Done()
 			<-start
+			var errs []error
 			for j := 0; j < samples; j++ {
 				got, body, err := runtimeResponse(e)
 				if err != nil {
-					errs <- err
+					errs = append(errs, err)
 					continue
 				}
 				if !got.Complete || got.ActualRunningTurns == nil {
-					errs <- fmt.Errorf("synthetic runtime source unexpectedly incomplete: %s", body)
+					errs = append(errs, fmt.Errorf("synthetic runtime source unexpectedly incomplete: %s", body))
 				}
 				for _, privateValue := range []string{"PRIVATE_PROJECT", "PRIVATE_SOURCE", "PRIVATE_PROMPT", "test:chat-1:user"} {
 					if strings.Contains(body, privateValue) {
-						errs <- fmt.Errorf("runtime response leaked private value %q", privateValue)
+						errs = append(errs, fmt.Errorf("runtime response leaked private value %q", privateValue))
 					}
 				}
 			}
-		}()
+			workerErrors[worker] = errs
+		}(i)
 	}
 	close(start)
 	session.events <- Event{Type: EventResult, Content: "synthetic completion", Done: true}
@@ -440,8 +442,9 @@ func TestRuntimeEndpointConcurrentRelaySnapshotsDoNotLeak(t *testing.T) {
 		t.Fatalf("HandleRelay() error = %v", err)
 	}
 	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Error(err)
+	for _, errs := range workerErrors {
+		for _, err := range errs {
+			t.Error(err)
+		}
 	}
 }
