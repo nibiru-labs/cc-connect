@@ -131,6 +131,31 @@ func rosterStoredChunks(chunks []string) map[int]rosterStoredChunk {
 	return stored
 }
 
+func makeReadyRosterStore(t *testing.T, path string, now func() time.Time) (*rosterTransferStore, rosterPiece, string, string) {
+	t.Helper()
+	raw := makeTestRoster(t, "saka", 31, "ready replay")
+	manifest, chunks := makeRosterTransferBodies(t, raw, "saka", 31, 1800)
+	if len(chunks) != 1 {
+		t.Fatalf("got %d chunks, want one", len(chunks))
+	}
+	manifestPiece, err := parseRosterPiece(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalPiece, err := parseRosterPiece(chunks[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newRosterTransferStore(path, now)
+	if result := store.add("manifest", "saka", "saka", manifestPiece); result.state != rosterReceivePending {
+		t.Fatalf("manifest result = %+v, want pending", result)
+	}
+	if result := store.add("final", "saka", "saka", finalPiece); result.state != rosterReceiveReady {
+		t.Fatalf("final chunk result = %+v, want ready", result)
+	}
+	return store, finalPiece, string(raw), rosterTransferKey("saka", 31, finalPiece.hash)
+}
+
 func TestRosterTransferReassemblesOutOfOrderAcrossRestartAndDeduplicates(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "roster-state.json")
 	raw := makeTestRoster(t, "saka", 31, strings.Repeat("x", 9000))
@@ -179,6 +204,91 @@ func TestRosterTransferReassemblesOutOfOrderAcrossRestartAndDeduplicates(t *test
 	}
 	if got := replayAcker.ok; len(got) != 1 || got[0] != final.MessageID {
 		t.Fatalf("replay was not transport-settled: %v", got)
+	}
+}
+
+func TestRosterReadyReplaySurvivesSeenIDTTLEvictionAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roster-state.json")
+	now := time.Now().UTC()
+	clock := func() time.Time { return now }
+	_, finalPiece, wantPayload, key := makeReadyRosterStore(t, path, clock)
+
+	now = now.Add(rosterSeenIDTTL + time.Second)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pruned rosterTransferDiskState
+	if err := json.Unmarshal(data, &pruned); err != nil {
+		t.Fatal(err)
+	}
+	pruneRosterTransferState(&pruned, now)
+	if _, exists := pruned.SeenMessages["final"]; exists {
+		t.Fatal("final message ID survived the seen-ID TTL")
+	}
+	if group := pruned.Groups[key]; group == nil || group.Status != "ready" {
+		t.Fatalf("ready group did not survive seen-ID TTL: %#v", group)
+	}
+
+	// A fresh platform models process restart; the final message ID is no longer in SeenMessages.
+	restarted, acker := newRosterReceiverPlatform(t, path, clock)
+	handler := &recorder{}
+	restarted.dispatch(context.Background(), handler.handle, in("final", "c1", "saka", finalPiece.body))
+	messages := handler.all()
+	if len(messages) != 1 || messages[0].Content != wantPayload {
+		t.Fatalf("final replay after seen-ID TTL reached handler as %d messages: %#v", len(messages), messages)
+	}
+	if len(acker.ok) != 0 {
+		t.Fatalf("ready replay was acknowledged before its turn finished: %v", acker.ok)
+	}
+}
+
+func TestRosterReadyReplaySurvivesSeenIDCapacityEvictionAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roster-state.json")
+	now := time.Now().UTC()
+	clock := func() time.Time { return now }
+	store, finalPiece, wantPayload, key := makeReadyRosterStore(t, path, clock)
+
+	store.mu.Lock()
+	if err := store.loadLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	next, err := cloneRosterTransferState(store.state)
+	if err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	next.SeenMessages["final"] = rosterSeenMessage{Key: key, Seen: now.Add(-time.Second)}
+	for i := 0; i < rosterMaxSeenIDs-1; i++ {
+		id := fmt.Sprintf("noise-%04d", i)
+		next.SeenMessages[id] = rosterSeenMessage{Key: key, Seen: now.Add(time.Duration(i+1) * time.Nanosecond)}
+	}
+	if err := store.commitLocked(next); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	_, finalStillSeen := store.state.SeenMessages["final"]
+	group := store.state.Groups[key]
+	readyGroupSurvives := group != nil && group.Status == "ready"
+	store.mu.Unlock()
+	if finalStillSeen {
+		t.Fatal("final message ID survived seen-ID capacity pruning")
+	}
+	if !readyGroupSurvives {
+		t.Fatalf("ready group did not survive seen-ID capacity pruning: %#v", group)
+	}
+
+	// A fresh platform models process restart after capacity pruning.
+	restarted, acker := newRosterReceiverPlatform(t, path, clock)
+	handler := &recorder{}
+	restarted.dispatch(context.Background(), handler.handle, in("final", "c1", "saka", finalPiece.body))
+	messages := handler.all()
+	if len(messages) != 1 || messages[0].Content != wantPayload {
+		t.Fatalf("final replay after seen-ID capacity pruning reached handler as %d messages: %#v", len(messages), messages)
+	}
+	if len(acker.ok) != 0 {
+		t.Fatalf("ready replay was acknowledged before its turn finished: %v", acker.ok)
 	}
 }
 

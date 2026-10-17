@@ -522,8 +522,12 @@ func (s *rosterTransferStore) add(messageID, sender, expectedIssuer string, piec
 	pruneRosterTransferState(&next, now)
 	key := rosterTransferKey(sender, piece.version, piece.hash)
 
-	if seen, ok := next.SeenMessages[messageID]; ok {
-		return s.replaySeenMessage(&next, messageID, sender, expectedIssuer, key, seen, now)
+	if group := next.Groups[key]; group != nil && group.Status == "ready" && group.FinalMessageID == messageID {
+		return s.replayReadyRoster(&next, sender, expectedIssuer, key, group, now)
+	}
+
+	if _, ok := next.SeenMessages[messageID]; ok {
+		return s.replaySeenMessage(&next, key)
 	}
 
 	if result, handled := s.rejectKnownRoster(&next, messageID, key, piece, now); handled {
@@ -540,23 +544,22 @@ func (s *rosterTransferStore) add(messageID, sender, expectedIssuer string, piec
 	return s.finishRosterPiece(&next, sender, expectedIssuer, messageID, key, group, piece, now)
 }
 
-func (s *rosterTransferStore) replaySeenMessage(next *rosterTransferDiskState, messageID, sender, expectedIssuer, key string, seen rosterSeenMessage, now time.Time) rosterReceiveResult {
-	if seen.Key == key {
-		if group := next.Groups[key]; group != nil && group.Status == "ready" && group.FinalMessageID == messageID {
-			payload, err := reassembleRosterTransfer(sender, expectedIssuer, group.ManifestBody, group.Chunks)
-			if err != nil || string(payload) != group.Payload {
-				rejectRosterGroup(next, key, now)
-				reason := "ready roster payload differs from its validated chunks"
-				if err != nil {
-					reason = "ready roster failed revalidation: " + err.Error()
-				}
-				return s.saveRosterResult(next, rosterReceiveResult{state: rosterReceiveRejected, key: key, reason: reason}, "persist corrupt ready roster rejection: ")
-			}
-			return s.saveRosterResult(next, rosterReceiveResult{state: rosterReceiveReady, key: key, payload: string(payload)}, "persist roster retry state: ")
-		}
-	}
+func (s *rosterTransferStore) replaySeenMessage(next *rosterTransferDiskState, key string) rosterReceiveResult {
 	return s.saveRosterResult(next, rosterReceiveResult{state: rosterReceiveDuplicate, key: key,
 		reason: "transport message ID was already recorded"}, "persist duplicate roster state: ")
+}
+
+func (s *rosterTransferStore) replayReadyRoster(next *rosterTransferDiskState, sender, expectedIssuer, key string, group *rosterTransferGroup, now time.Time) rosterReceiveResult {
+	payload, err := reassembleRosterTransfer(sender, expectedIssuer, group.ManifestBody, group.Chunks)
+	if err != nil || string(payload) != group.Payload {
+		rejectRosterGroup(next, key, now)
+		reason := "ready roster payload differs from its validated chunks"
+		if err != nil {
+			reason = "ready roster failed revalidation: " + err.Error()
+		}
+		return s.saveRosterResult(next, rosterReceiveResult{state: rosterReceiveRejected, key: key, reason: reason}, "persist corrupt ready roster rejection: ")
+	}
+	return s.saveRosterResult(next, rosterReceiveResult{state: rosterReceiveReady, key: key, payload: string(payload)}, "persist roster retry state: ")
 }
 
 func (s *rosterTransferStore) rejectKnownRoster(next *rosterTransferDiskState, messageID, key string, piece rosterPiece, now time.Time) (rosterReceiveResult, bool) {
