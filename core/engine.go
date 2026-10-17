@@ -413,10 +413,10 @@ type Engine struct {
 	references          ReferenceRenderCfg
 	relayManager        *RelayManager
 	eventIdleTimeout    time.Duration
-	staleLockBreakAfter time.Duration // busy-lock stale-break threshold; 0 disables
-	maxTurnTime         time.Duration // absolute wall-clock cap per turn (0 = disabled)
+	staleLockBreakAfter time.Duration   // busy-lock stale-break threshold; 0 disables
+	maxTurnTime         time.Duration   // absolute wall-clock cap per turn (0 = disabled)
 	lifecycle           nibiruLifecycle // rotate/compress-by-percent settings; nibiru#836
-	firstEventTimeout   time.Duration // max wait for the first agent event of a turn (0 = disabled); nibiru#836
+	firstEventTimeout   time.Duration   // max wait for the first agent event of a turn (0 = disabled); nibiru#836
 	// agentSessionIdleTimeoutNanos 在单轮正常结束后关闭空闲的 live agent 进程，
 	// 同时保留已保存的 session ID，便于下次继续恢复。
 	agentSessionIdleTimeoutNanos atomic.Int64
@@ -585,8 +585,10 @@ type interactiveState struct {
 	// events between user-initiated turns (e.g. background task completions).
 	// Cancel unsolicitedCancel to stop the reader; wait on unsolicitedDone
 	// to confirm it has exited before starting a new foreground turn.
-	unsolicitedCancel context.CancelFunc // nil when no reader is running
-	unsolicitedDone   chan struct{}      // closed when the reader goroutine exits
+	unsolicitedCancel           context.CancelFunc // nil when no reader is running
+	unsolicitedDone             chan struct{}      // closed when the reader goroutine exits
+	unsolicitedReaderGeneration uint64             // guards state updates from stale readers
+	unsolicitedTurnActive       bool               // guarded by mu; true while a turn is in flight
 
 	// agentSessionIdleCancel 取消当前会话的 idle 关闭计时器。
 	agentSessionIdleCancel context.CancelFunc
@@ -4591,6 +4593,7 @@ func (e *Engine) scheduleAgentSessionIdleClose(sessionKey string, state *interac
 	if state.stopped ||
 		state.agentSession == nil ||
 		!state.agentSession.Alive() ||
+		state.unsolicitedTurnActive ||
 		state.eventsNeedResync ||
 		state.pending != nil ||
 		len(state.pendingMessages) > 0 {
@@ -4629,6 +4632,7 @@ func (e *Engine) cleanupInteractiveStateForIdleToken(sessionKey string, expected
 		state.agentSession == nil ||
 		!state.agentSession.Alive() ||
 		state.stopped ||
+		state.unsolicitedTurnActive ||
 		state.eventsNeedResync ||
 		state.pending != nil ||
 		len(state.pendingMessages) > 0 {
@@ -4912,6 +4916,8 @@ func (e *Engine) stopUnsolicitedReader(state *interactiveState) {
 	done := state.unsolicitedDone
 	state.unsolicitedCancel = nil
 	state.unsolicitedDone = nil
+	state.unsolicitedReaderGeneration++
+	state.unsolicitedTurnActive = false
 	state.mu.Unlock()
 
 	if cancel == nil {
@@ -4961,17 +4967,58 @@ func (e *Engine) startUnsolicitedReader(state *interactiveState, session *Sessio
 	state.mu.Lock()
 	state.unsolicitedCancel = cancel
 	state.unsolicitedDone = done
+	state.unsolicitedReaderGeneration++
+	readerGeneration := state.unsolicitedReaderGeneration
+	state.unsolicitedTurnActive = false
 	state.mu.Unlock()
 
-	go e.runUnsolicitedReader(ctx, cancel, done, state, agentSession, session, sessions, sessionKey, workspaceDir)
+	go e.runUnsolicitedReader(ctx, cancel, done, state, readerGeneration, agentSession, session, sessions, sessionKey, workspaceDir, nil)
 }
 
 // runUnsolicitedReader is the goroutine body for the unsolicited event reader.
 // agentSession is captured by the caller so we don't race with
-// cleanupInteractiveState nilling state.agentSession.
-func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.CancelFunc, done chan struct{}, state *interactiveState, agentSession AgentSession, session *Session, sessions *SessionManager, sessionKey string, workspaceDir string) {
+// cleanupInteractiveState nilling state.agentSession. beforeBeginTurn is an
+// optional synchronization seam for ownership-handoff tests.
+func (e *Engine) beginUnsolicitedTurn(state *interactiveState, readerGeneration uint64) bool {
+	state.mu.Lock()
+	if state.unsolicitedReaderGeneration != readerGeneration || state.stopped || state.agentSession == nil {
+		state.mu.Unlock()
+		return false
+	}
+	state.unsolicitedTurnActive = true
+	idleCancel := state.agentSessionIdleCancel
+	state.agentSessionIdleCancel = nil
+	state.agentSessionIdleToken = 0
+	state.mu.Unlock()
+	if idleCancel != nil {
+		idleCancel()
+	}
+	return true
+}
+
+func (e *Engine) finishUnsolicitedTurn(state *interactiveState, readerGeneration uint64) {
+	state.mu.Lock()
+	if state.unsolicitedReaderGeneration == readerGeneration {
+		state.unsolicitedTurnActive = false
+	}
+	state.mu.Unlock()
+}
+
+func (e *Engine) completeUnsolicitedTurn(state *interactiveState, readerGeneration uint64) bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.unsolicitedReaderGeneration != readerGeneration {
+		return false
+	}
+	state.unsolicitedTurnActive = false
+	state.eventsNeedResync = false
+	return true
+}
+
+func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.CancelFunc, done chan struct{}, state *interactiveState, readerGeneration uint64, agentSession AgentSession, session *Session, sessions *SessionManager, sessionKey string, workspaceDir string, beforeBeginTurn func()) {
 	defer close(done)
 	defer cancel()
+	defer e.finishUnsolicitedTurn(state, readerGeneration)
 
 	events := agentSession.Events()
 
@@ -5030,6 +5077,22 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				state.mu.Unlock()
 				return
 			default:
+			}
+			if beforeBeginTurn != nil {
+				beforeBeginTurn()
+			}
+
+			// Claim this event only if this reader is still current. The shared
+			// active marker cancels an existing idle timer and prevents a later
+			// schedule call from arming one while the turn is running.
+			if !e.beginUnsolicitedTurn(state, readerGeneration) {
+				// This reader already removed an event from Events(), but lost
+				// ownership before it could process it. Force the foreground
+				// handoff to drain any remaining events from that old turn.
+				state.mu.Lock()
+				state.eventsNeedResync = true
+				state.mu.Unlock()
+				return
 			}
 
 			// Mark workspace active on first event.
@@ -5105,9 +5168,9 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				}
 
 				// Mark clean exit so next foreground turn preserves events.
-				state.mu.Lock()
-				state.eventsNeedResync = false
-				state.mu.Unlock()
+				if !e.completeUnsolicitedTurn(state, readerGeneration) {
+					return
+				}
 
 				// Reset the per-session idle close timer so a series of
 				// background task completions does not get cut short by the
