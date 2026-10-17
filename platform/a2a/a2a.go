@@ -30,8 +30,9 @@ const (
 
 // replyContext is the replyCtx handed to Reply/Send.
 type replyContext struct {
-	ConversationID string
-	MessageIDs     []string // inbound messages covered by this turn; acked once the turn succeeds
+	ConversationID    string
+	MessageIDs        []string // inbound messages covered by this turn; acked once the turn succeeds
+	rosterTransferKey string   // non-empty only for a completely validated roster transfer
 }
 
 // Acker is implemented by L2 (ack.go).
@@ -51,6 +52,7 @@ type Platform struct {
 	client   Client
 	acker    Acker
 	allow    map[string]bool
+	roster   *rosterReceiver
 	interval time.Duration
 	maxChunk int
 
@@ -72,6 +74,9 @@ func New(opts map[string]any) (core.Platform, error) {
 	bin, _ := opts["a2a_bin"].(string)
 	c := newCLIClient(bin)
 	p := newPlatform(c, NewAcker(c, AckerConfig{}), opts)
+	if p.roster != nil && p.roster.configErr != nil {
+		return nil, fmt.Errorf("a2a: invalid roster_issuer configuration: %w", p.roster.configErr)
+	}
 	p.pong = NewPongHandler(c, 0).HandleSettled
 	return p, nil
 }
@@ -118,7 +123,7 @@ func newPlatform(c Client, a Acker, opts map[string]any) *Platform {
 		maxChunk = defaultMaxChunk
 	}
 	return &Platform{
-		client: c, acker: a, allow: allow, interval: interval, maxChunk: maxChunk,
+		client: c, acker: a, allow: allow, roster: newRosterReceiver(opts, allow), interval: interval, maxChunk: maxChunk,
 		inflight: map[string]bool{}, done: map[string]time.Time{}, replies: map[string]int{},
 	}
 }
@@ -233,7 +238,35 @@ func (p *Platform) dispatch(ctx context.Context, handler core.MessageHandler, m 
 		p.release(m.MessageID, true)
 		return
 	}
+	if p.roster != nil && p.roster.isTransferMessage(m.Text) {
+		p.dispatchRoster(ctx, handler, m)
+		return
+	}
 
+	p.dispatchMessage(handler, m, m.Text, "")
+}
+
+func (p *Platform) dispatchRoster(ctx context.Context, handler core.MessageHandler, m Inbound) {
+	result := p.roster.accept(m)
+	logRosterResult(m, result)
+	if result.retryable {
+		slog.Warn("a2a: roster state unavailable; message remains retryable",
+			"message_id", m.MessageID, "reason", result.reason)
+		p.release(m.MessageID, false)
+		return
+	}
+	if result.state != rosterReceiveReady {
+		// Partial pieces are acknowledged only after durable persistence. Invalid
+		// and duplicate envelopes are terminal transport inputs and never reach
+		// the model path.
+		p.acker.TurnSucceededIDs([]string{m.MessageID})
+		p.release(m.MessageID, true)
+		return
+	}
+	p.dispatchMessage(handler, m, result.payload, result.key)
+}
+
+func (p *Platform) dispatchMessage(handler core.MessageHandler, m Inbound, content, rosterTransferKey string) {
 	key := "a2a:" + m.ConversationID
 	p.acker.Track(key, []string{m.MessageID})
 	handler(p, &core.Message{
@@ -243,8 +276,8 @@ func (p *Platform) dispatch(ctx context.Context, handler core.MessageHandler, m 
 		ChannelID:  m.ConversationID,
 		UserID:     m.SenderID,
 		UserName:   m.SenderID,
-		Content:    m.Text,
-		ReplyCtx:   &replyContext{ConversationID: m.ConversationID, MessageIDs: []string{m.MessageID}},
+		Content:    content,
+		ReplyCtx:   &replyContext{ConversationID: m.ConversationID, MessageIDs: []string{m.MessageID}, rosterTransferKey: rosterTransferKey},
 	})
 }
 
@@ -308,6 +341,13 @@ func (p *Platform) FinishTurn(_ context.Context, replyCtx any, ok bool) {
 	}
 	sessionKey := "a2a:" + rc.ConversationID
 	if ok {
+		if rc.rosterTransferKey != "" && p.roster != nil {
+			if err := p.roster.markDelivered(rc.rosterTransferKey, rc.MessageIDs[0]); err != nil {
+				p.acker.TurnFailedIDs(sessionKey, rc.MessageIDs, fmt.Errorf("a2a: persist roster completion: %w", err))
+				p.finish(rc, false)
+				return
+			}
+		}
 		p.acker.TurnSucceededIDs(rc.MessageIDs)
 	} else {
 		p.acker.TurnFailedIDs(sessionKey, rc.MessageIDs, fmt.Errorf("a2a: turn did not complete"))
