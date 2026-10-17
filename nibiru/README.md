@@ -35,6 +35,16 @@ The script does not restart the service.
 A2A projects default to sonnet; on DingTalk projects the user switches with `/model`.
 Merge it into `~/.cc-connect/config.toml` by hand (secrets stay in `~/.cc-connect/dingtalk.env`; never commit them).
 
+## Unified session (nibiru#966)
+
+`unified_session = true` (project level, default false) merges every platform/conversation of the project
+into one agent session: key `unified:<project>`, messages serialised through the existing busy queue, per-message
+reply ctx kept (replies return to their source), prompts prefixed with `[cc-connect source platform= sender_id=
+sender_name= conversation= msg_id=]`. Slash commands/permission answers are not tagged. Sample:
+`nibiru/deploy/config.unified.example.toml` (DingTalk + WeChat + A2A in one project). Code: `core/unified_session.go`.
+Not supported together with `mode = "multi-workspace"` (config load rejects the combination).
+Note: a message arriving while a turn runs gets the stock "queued" notice on its own platform (on A2A that is one extra message).
+
 ## Switching the inbox consumer (one consumer only!)
 
 Two things must never read the same A2A inbox: `com.nibiru.sakura-runner` (python runner) and cc-connect's a2a platform.

@@ -443,6 +443,10 @@ type Message struct {
 	// drop late redeliveries that reuse a new message_id but an older create_time
 	// than a message already processed. Zero means unset (no ordering hint).
 	UserMessageTimeMs int64
+	// OriginSessionKey is the platform's own session key before unified_session
+	// (nibiru#966) rewrote SessionKey; empty when unified_session is off.
+	OriginSessionKey string
+	sourceTagged     bool
 }
 
 // EventType distinguishes different kinds of agent output.

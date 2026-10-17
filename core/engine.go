@@ -366,6 +366,7 @@ type Engine struct {
 	tts                   *TTSCfg
 	display               DisplayCfg
 	injectSender          bool
+	unifiedSession        bool // nibiru#966: all sources share one session key
 	attachmentSendEnabled bool
 	startedAt             time.Time
 
@@ -413,10 +414,10 @@ type Engine struct {
 	references          ReferenceRenderCfg
 	relayManager        *RelayManager
 	eventIdleTimeout    time.Duration
-	staleLockBreakAfter time.Duration // busy-lock stale-break threshold; 0 disables
-	maxTurnTime         time.Duration // absolute wall-clock cap per turn (0 = disabled)
+	staleLockBreakAfter time.Duration   // busy-lock stale-break threshold; 0 disables
+	maxTurnTime         time.Duration   // absolute wall-clock cap per turn (0 = disabled)
 	lifecycle           nibiruLifecycle // rotate/compress-by-percent settings; nibiru#836
-	firstEventTimeout   time.Duration // max wait for the first agent event of a turn (0 = disabled); nibiru#836
+	firstEventTimeout   time.Duration   // max wait for the first agent event of a turn (0 = disabled); nibiru#836
 	// agentSessionIdleTimeoutNanos 在单轮正常结束后关闭空闲的 live agent 进程，
 	// 同时保留已保存的 session ID，便于下次继续恢复。
 	agentSessionIdleTimeoutNanos atomic.Int64
@@ -538,6 +539,8 @@ type workspaceInitFlow struct {
 // sends it after the current turn completes to avoid mid-turn interference.
 type queuedMessage struct {
 	messageID         string
+	sessionKey        string
+	originSessionKey  string
 	platform          Platform
 	replyCtx          any
 	content           string
@@ -558,28 +561,31 @@ type interactiveState struct {
 	// busySession is the core.Session whose busy lock guards the in-flight
 	// turn. Set by getOrCreateInteractiveStateWith so /stop can release the
 	// lock after tearing the turn down (#1830).
-	busySession              *Session
-	platform                 Platform
-	replyCtx                 any
-	currentMessageID         string
-	lastRecallProbeMessageID string
-	lastRecallProbeAt        time.Time
-	recallProbeInFlight      bool
-	workspaceDir             string
-	agent                    Agent
-	mu                       sync.Mutex
-	stopCh                   chan struct{}
-	stopped                  bool
-	pending                  *pendingPermission
-	pendingMessages          []queuedMessage // messages queued while session was busy
-	approveAll               bool            // when true, auto-approve all permission requests for this session
-	fromVoice                bool            // true if current turn originated from voice transcription
-	sideText                 string
-	deleteMode               *deleteModeState
-	modelSwitch              *modelSwitchState
-	pendingProviderAdd       *pendingProviderAddState
-	lastAutoCompressAt       time.Time
-	lastAutoCompressTokens   int
+	busySession                 *Session
+	platform                    Platform
+	replyCtx                    any
+	currentMessageID            string
+	currentTurnSessionKey       string
+	currentTurnOriginSessionKey string
+	currentTurnLockGen          uint64
+	lastRecallProbeMessageID    string
+	lastRecallProbeAt           time.Time
+	recallProbeInFlight         bool
+	workspaceDir                string
+	agent                       Agent
+	mu                          sync.Mutex
+	stopCh                      chan struct{}
+	stopped                     bool
+	pending                     *pendingPermission
+	pendingMessages             []queuedMessage // messages queued while session was busy
+	approveAll                  bool            // when true, auto-approve all permission requests for this session
+	fromVoice                   bool            // true if current turn originated from voice transcription
+	sideText                    string
+	deleteMode                  *deleteModeState
+	modelSwitch                 *modelSwitchState
+	pendingProviderAdd          *pendingProviderAddState
+	lastAutoCompressAt          time.Time
+	lastAutoCompressTokens      int
 
 	// Unsolicited event reader: a background goroutine that consumes agent
 	// events between user-initiated turns (e.g. background task completions).
@@ -1501,6 +1507,49 @@ func (e *Engine) ActiveSessionKeys() []string {
 	return keys
 }
 
+// currentUnifiedRouteForSession returns the trusted source route for the
+// currently locked turn of a unified agent session. The route is recorded from
+// inbound Message.OriginSessionKey and advances with queued turns; caller JSON
+// must never select it. The session lock generation prevents a stale route
+// from a previous turn being used in the gap before a newly acquired turn is
+// recorded.
+func (e *Engine) currentUnifiedRouteForSession(sessionKey string) (string, bool) {
+	if !e.unifiedSession || sessionKey != UnifiedSessionKey(e.name) {
+		return "", false
+	}
+
+	e.interactiveMu.Lock()
+	defer e.interactiveMu.Unlock()
+
+	var route string
+	matches := 0
+	for _, state := range e.interactiveStates {
+		if state == nil {
+			continue
+		}
+		state.mu.Lock()
+		if state.currentTurnSessionKey != sessionKey || state.currentTurnOriginSessionKey == "" || state.busySession == nil || state.currentTurnLockGen == 0 {
+			state.mu.Unlock()
+			continue
+		}
+		lockGen, busy := state.busySession.busyLockGeneration()
+		if !busy || lockGen != state.currentTurnLockGen {
+			state.mu.Unlock()
+			continue
+		}
+		candidate := state.currentTurnOriginSessionKey
+		state.mu.Unlock()
+		if route != "" {
+			// A shared identity must not choose between concurrent workspace
+			// turns. Fail closed if more than one active route claims it.
+			return "", false
+		}
+		route = candidate
+		matches++
+	}
+	return route, matches == 1 && route != ""
+}
+
 // ExecuteCronJob runs a cron job by injecting a synthetic message into the engine.
 // It finds the platform that owns the session key, reconstructs a reply context,
 // and processes the message as if the user sent it.
@@ -1513,9 +1562,11 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	})
 
 	sessionKey := job.SessionKey
+	platformSessionKey := job.platformSessionKey()
+	hasSeparateRoute := job.RouteSessionKey != ""
 	platformName := ""
-	if idx := strings.Index(sessionKey, ":"); idx > 0 {
-		platformName = sessionKey[:idx]
+	if idx := strings.Index(platformSessionKey, ":"); idx > 0 {
+		platformName = platformSessionKey[:idx]
 	}
 
 	var targetPlatform Platform
@@ -1531,16 +1582,21 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	if targetPlatform == nil {
 		for _, p := range e.platforms {
 			needle := ":" + p.Name() + ":"
-			if idx := strings.Index(sessionKey, needle); idx >= 0 {
+			if idx := strings.Index(platformSessionKey, needle); idx >= 0 {
 				targetPlatform = p
 				platformName = p.Name()
-				sessionKey = sessionKey[idx+1:] // strip workspace prefix
+				platformSessionKey = platformSessionKey[idx+1:] // strip workspace prefix
 				break
 			}
 		}
 	}
 	if targetPlatform == nil {
-		return fmt.Errorf("platform %q not found for session %q", platformName, sessionKey)
+		return fmt.Errorf("platform %q not found for session %q", platformName, platformSessionKey)
+	}
+	if !hasSeparateRoute {
+		// Preserve legacy workspace-key normalization for jobs where identity and
+		// delivery were represented by the same session key.
+		sessionKey = platformSessionKey
 	}
 
 	rc, ok := targetPlatform.(ReplyContextReconstructor)
@@ -1549,18 +1605,22 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	}
 
 	runSessionKey := sessionKey
+	replySessionKey := platformSessionKey
 	var replyCtx any
 	var err error
 	if !job.Mute {
 		if resolver, ok := targetPlatform.(CronReplyTargetResolver); ok {
-			resolvedSessionKey, resolvedReplyCtx, err := resolver.ResolveCronReplyTarget(sessionKey, cronRunTitle(job))
+			resolvedSessionKey, resolvedReplyCtx, err := resolver.ResolveCronReplyTarget(platformSessionKey, cronRunTitle(job))
 			if err != nil {
 				if !errors.Is(err, ErrNotSupported) {
 					return fmt.Errorf("resolve cron reply target: %w", err)
 				}
 			} else {
 				if resolvedSessionKey != "" {
-					runSessionKey = resolvedSessionKey
+					replySessionKey = resolvedSessionKey
+					if !hasSeparateRoute {
+						runSessionKey = resolvedSessionKey
+					}
 				}
 				if resolvedReplyCtx != nil {
 					replyCtx = resolvedReplyCtx
@@ -1569,7 +1629,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		}
 	}
 	if replyCtx == nil {
-		replyCtx, err = rc.ReconstructReplyCtx(runSessionKey)
+		replyCtx, err = rc.ReconstructReplyCtx(replySessionKey)
 		if err != nil {
 			return fmt.Errorf("reconstruct reply context: %w", err)
 		}
@@ -1609,13 +1669,14 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	content := job.Prompt
 
 	msg := &Message{
-		SessionKey:   sessionKey,
-		Platform:     platformName,
-		UserID:       "cron",
-		UserName:     "cron",
-		Content:      content,
-		ReplyCtx:     replyCtx,
-		ModeOverride: job.Mode,
+		SessionKey:       sessionKey,
+		OriginSessionKey: job.RouteSessionKey,
+		Platform:         platformName,
+		UserID:           "cron",
+		UserName:         "cron",
+		Content:          content,
+		ReplyCtx:         replyCtx,
+		ModeOverride:     job.Mode,
 	}
 
 	// Resolve workspace-specific agent and sessions for multi-workspace mode.
@@ -1625,7 +1686,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	workspaceDir := ""
 
 	if e.multiWorkspace {
-		channelID := extractChannelID(sessionKey)
+		channelID := extractChannelID(platformSessionKey)
 		if channelID != "" {
 			workspace, _, err := e.resolveWorkspace(targetPlatform, channelID)
 			if err == nil && workspace != "" {
@@ -3070,6 +3131,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		}
 	}
 
+	// nibiru#966: merge every source into one session key (reply ctx stays per message).
+	e.applyUnifiedSession(msg)
+
 	// Multi-workspace resolution
 	var wsAgent Agent
 	var wsSessions *SessionManager
@@ -3193,6 +3257,10 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		return
 	}
 
+	// nibiru#966: label the source (platform/sender/conversation) for the model.
+	// After command/permission handling so slash commands stay untouched.
+	e.tagUnifiedSource(msg)
+
 	session := sessions.GetOrCreateActive(msg.SessionKey)
 	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
 	// Ensure an interactiveState entry exists before taking the session lock.
@@ -3203,6 +3271,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	if gen, locked := session.TryLock(); locked {
 		lockGen = gen
 	} else {
+		if receiveAfterBusyTryLockHook != nil {
+			receiveAfterBusyTryLockHook()
+		}
 		if e.stopCurrentMessageIfRecalled(interactiveKey) {
 			if g, ok := e.waitForSessionLock(session, recalledStopLockWait); ok {
 				lockGen = g
@@ -3256,6 +3327,30 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 				go e.drainOrphanedQueue(session, sessions, interactiveKey, agent, resolvedWorkspace, g)
 			}
 			return
+		}
+
+		// Rotation can remove the interactive state after this turn's TryLock
+		// fails but before queueMessageForBusySession looks it up. If commitRotate
+		// released the lock in that window, take it and process this message as a
+		// fresh turn instead of reporting PreviousProcessing.
+		if g, ok := session.TryLock(); ok {
+			lockGen = g
+			goto sessionLocked
+		}
+
+		// Another inbound turn may have won the released lock before registering
+		// its replacement state. Restore a queue target and retry once so this
+		// message joins that turn rather than being dropped during state handoff.
+		e.ensureInteractiveStateForQueueing(interactiveKey, p, msg.ReplyCtx)
+		if e.queueMessageForBusySession(p, msg, interactiveKey) {
+			if g, ok := session.TryLock(); ok {
+				go e.drainOrphanedQueue(session, sessions, interactiveKey, agent, resolvedWorkspace, g)
+			}
+			return
+		}
+		if g, ok := session.TryLock(); ok {
+			lockGen = g
+			goto sessionLocked
 		}
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 		return
@@ -3428,6 +3523,8 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
 		messageID:         msg.MessageID,
+		sessionKey:        msg.SessionKey,
+		originSessionKey:  msg.OriginSessionKey,
 		platform:          p,
 		replyCtx:          msg.ReplyCtx,
 		content:           msg.Content,
@@ -3988,6 +4085,9 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	state.platform = p
 	state.replyCtx = msg.ReplyCtx
 	state.currentMessageID = msg.MessageID
+	state.currentTurnSessionKey = msg.SessionKey
+	state.currentTurnOriginSessionKey = msg.OriginSessionKey
+	state.currentTurnLockGen = lockGen
 	state.currentTurnUserMessageTimeMs = msg.UserMessageTimeMs
 	state.mu.Unlock()
 	stopRecallMonitor := e.startMessageRecallMonitor(interactiveKey)
@@ -6476,6 +6576,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.platform = queued.platform
 				state.replyCtx = queued.replyCtx
 				state.currentMessageID = queued.messageID
+				state.currentTurnSessionKey = queued.sessionKey
+				state.currentTurnOriginSessionKey = queued.originSessionKey
+				state.currentTurnLockGen = lockGen
 				state.fromVoice = queued.fromVoice
 				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 				state.mu.Unlock()
@@ -6830,6 +6933,10 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.platform = queued.platform
 		state.replyCtx = queued.replyCtx
 		state.currentMessageID = queued.messageID
+		state.currentTurnSessionKey = queued.sessionKey
+		state.currentTurnOriginSessionKey = queued.originSessionKey
+		state.currentTurnLockGen = lockGen
+		state.busySession = session
 		state.fromVoice = queued.fromVoice
 		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 		state.mu.Unlock()
@@ -14605,13 +14712,14 @@ func (e *Engine) cmdCronAdd(p Platform, msg *Message, args []string) {
 	prompt := strings.Join(args[5:], " ")
 
 	job := &CronJob{
-		ID:         GenerateCronID(),
-		Project:    e.name,
-		SessionKey: msg.SessionKey,
-		CronExpr:   cronExpr,
-		Prompt:     prompt,
-		Enabled:    true,
-		CreatedAt:  time.Now(),
+		ID:              GenerateCronID(),
+		Project:         e.name,
+		SessionKey:      msg.SessionKey,
+		RouteSessionKey: msg.OriginSessionKey,
+		CronExpr:        cronExpr,
+		Prompt:          prompt,
+		Enabled:         true,
+		CreatedAt:       time.Now(),
 	}
 
 	if err := e.cronScheduler.AddJob(job); err != nil {
@@ -14638,13 +14746,14 @@ func (e *Engine) cmdCronAddExec(p Platform, msg *Message, args []string) {
 	shellCmd := strings.Join(args[5:], " ")
 
 	job := &CronJob{
-		ID:         GenerateCronID(),
-		Project:    e.name,
-		SessionKey: msg.SessionKey,
-		CronExpr:   cronExpr,
-		Exec:       shellCmd,
-		Enabled:    true,
-		CreatedAt:  time.Now(),
+		ID:              GenerateCronID(),
+		Project:         e.name,
+		SessionKey:      msg.SessionKey,
+		RouteSessionKey: msg.OriginSessionKey,
+		CronExpr:        cronExpr,
+		Exec:            shellCmd,
+		Enabled:         true,
+		CreatedAt:       time.Now(),
 	}
 
 	if err := e.cronScheduler.AddJob(job); err != nil {

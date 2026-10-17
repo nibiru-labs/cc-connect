@@ -371,13 +371,13 @@ func (s *APIServer) handleCronAdd(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "project is required (multiple projects configured)", http.StatusBadRequest)
 		return
 	}
+	s.mu.RLock()
+	engine := s.engines[project]
+	s.mu.RUnlock()
 
 	// Resolve session_key: use provided, or auto-detect from active sessions
 	sessionKey := req.SessionKey
 	if sessionKey == "" {
-		s.mu.RLock()
-		engine := s.engines[project]
-		s.mu.RUnlock()
 		if engine != nil {
 			keys := engine.ActiveSessionKeys()
 			if len(keys) == 1 {
@@ -391,20 +391,41 @@ func (s *APIServer) handleCronAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// For unified identities, derive delivery routing from the Engine's active
+	// turn. A route supplied in JSON is deliberately not an authority source.
+	routeSessionKey := ""
+	if strings.HasPrefix(sessionKey, "unified:") {
+		if engine == nil || !engine.unifiedSession || sessionKey != UnifiedSessionKey(engine.name) {
+			http.Error(w, "unified session identity does not match the selected project", http.StatusBadRequest)
+			return
+		}
+		var ok bool
+		routeSessionKey, ok = engine.currentUnifiedRouteForSession(sessionKey)
+		if !ok {
+			http.Error(w, "no active source route for this unified session", http.StatusBadRequest)
+			return
+		}
+		if !engine.HasPlatformForSession(routeSessionKey) {
+			http.Error(w, "active source route does not match a platform configured for this project", http.StatusBadRequest)
+			return
+		}
+	}
+
 	job := &CronJob{
-		ID:          GenerateCronID(),
-		Project:     project,
-		SessionKey:  sessionKey,
-		CronExpr:    req.CronExpr,
-		Prompt:      req.Prompt,
-		Exec:        req.Exec,
-		WorkDir:     req.WorkDir,
-		Description: req.Description,
-		Enabled:     true,
-		Silent:      req.Silent,
-		SessionMode: NormalizeCronSessionMode(req.SessionMode),
-		Mode:        req.Mode,
-		TimeoutMins: req.TimeoutMins,
+		ID:              GenerateCronID(),
+		Project:         project,
+		SessionKey:      sessionKey,
+		RouteSessionKey: routeSessionKey,
+		CronExpr:        req.CronExpr,
+		Prompt:          req.Prompt,
+		Exec:            req.Exec,
+		WorkDir:         req.WorkDir,
+		Description:     req.Description,
+		Enabled:         true,
+		Silent:          req.Silent,
+		SessionMode:     NormalizeCronSessionMode(req.SessionMode),
+		Mode:            req.Mode,
+		TimeoutMins:     req.TimeoutMins,
 	}
 	job.CreatedAt = time.Now()
 

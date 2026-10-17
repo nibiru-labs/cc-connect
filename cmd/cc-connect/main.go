@@ -737,6 +737,9 @@ func main() {
 			}
 		}
 
+		// nibiru#966: merge all sources into one agent session
+		engine.SetUnifiedSession(proj.UnifiedSession)
+
 		// Wire sender injection
 		if proj.InjectSender != nil {
 			engine.SetInjectSender(*proj.InjectSender)

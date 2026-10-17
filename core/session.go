@@ -88,6 +88,15 @@ func (s *Session) Busy() bool {
 	return s.busy
 }
 
+// busyLockGeneration reports the generation that currently owns the session
+// lock. Callers that cache turn-scoped state can reject stale data after a
+// session unlock/relock cycle.
+func (s *Session) busyLockGeneration() (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lockGen, s.busy
+}
+
 func (s *Session) Unlock(gen uint64) {
 	s.unlock(true, gen)
 }

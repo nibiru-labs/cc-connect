@@ -74,6 +74,7 @@ type env struct {
 
 type startOpts struct {
 	allowFrom string
+	unified   bool // unified_session = true (nibiru#966)
 }
 
 func start(t *testing.T, o startOpts) *env {
@@ -97,7 +98,7 @@ level = "debug"
 
 [[projects]]
 name = "e2e"
-
+%s
 [projects.agent]
 type = "claudecode"
 
@@ -113,7 +114,7 @@ type = "a2a"
 a2a_bin = %q
 allow_from = %q
 poll_interval = "200ms"
-`, filepath.Join(dir, "data"), work, filepath.Join(binDir, "claude"), filepath.Join(binDir, "fakea2a"), o.allowFrom)
+`, filepath.Join(dir, "data"), unifiedLine(o.unified), work, filepath.Join(binDir, "claude"), filepath.Join(binDir, "fakea2a"), o.allowFrom)
 	cfgPath := filepath.Join(dir, "config.toml")
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -143,6 +144,13 @@ poll_interval = "200ms"
 		}
 	})
 	return e
+}
+
+func unifiedLine(on bool) string {
+	if on {
+		return "unified_session = true\n"
+	}
+	return ""
 }
 
 func (e *env) enqueue(msgs ...queue.Msg) {
@@ -316,4 +324,48 @@ func repliedTo(st queue.State, id string) bool {
 		}
 	}
 	return false
+}
+
+// nibiru#966: two different A2A conversations share ONE model session when
+// unified_session is on: the second conversation sees the first's context,
+// and each message is still answered in its own conversation.
+func TestUnifiedSessionSharesOneModelAcrossConversations(t *testing.T) {
+	e := start(t, startOpts{unified: true})
+	e.enqueue(queue.Msg{MessageID: "u1", ConversationID: "cA", SenderID: "dot", Text: "alpha-question"})
+	e.waitFor("u1 acked", wait, func(s queue.State) bool { return contains(s.Acked, "u1") })
+	e.enqueue(queue.Msg{MessageID: "u2", ConversationID: "cB", SenderID: "grok", Text: "beta-question"})
+	st := e.waitFor("u2 acked", wait, func(s queue.State) bool { return contains(s.Acked, "u2") })
+
+	var r1, r2 string
+	for _, s := range st.Sent {
+		switch s.ReplyTo {
+		case "u1":
+			r1 += s.Text
+		case "u2":
+			r2 += s.Text
+		}
+	}
+	if !strings.Contains(r1, "turn=1") || !strings.Contains(r2, "turn=2") {
+		t.Fatalf("both conversations must hit the same model process (turn=1 then turn=2): r1=%q r2=%q", r1, r2)
+	}
+	if !strings.Contains(r2, "alpha-question") {
+		t.Fatalf("second conversation must see first's context (prev=...): %q", r2)
+	}
+	ps := e.prompts()
+	if len(ps) != 2 || !strings.Contains(ps[0], "conversation=a2a:cA") || !strings.Contains(ps[1], "sender_id=grok") {
+		t.Fatalf("prompts must carry source tags: %v", ps)
+	}
+}
+
+// Without unified_session the same two conversations stay isolated (turn=1 each is
+// not guaranteed to be separate processes, so assert on the tag absence only).
+func TestNonUnifiedHasNoSourceTag(t *testing.T) {
+	e := start(t, startOpts{})
+	e.enqueue(queue.Msg{MessageID: "n1", ConversationID: "cA", SenderID: "dot", Text: "plain-question"})
+	e.waitFor("n1 acked", wait, func(s queue.State) bool { return contains(s.Acked, "n1") })
+	for _, p := range e.prompts() {
+		if strings.Contains(p, "[cc-connect source") {
+			t.Fatalf("source tag present without unified_session: %q", p)
+		}
+	}
 }
