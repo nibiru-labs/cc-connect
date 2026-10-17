@@ -114,10 +114,11 @@ func TestReplySuccessAndFailure(t *testing.T) {
 	if err := p.Reply(context.Background(), rc, "ok"); err != nil {
 		t.Fatal(err)
 	}
-	if len(c.sent) != 1 || c.sent[0].replyTo != "m1" || c.sent[0].key != "m1-1" || c.sent[0].text != "ok" {
+	if len(c.sent) != 1 || c.sent[0].replyTo != "m1" ||
+		c.sent[0].key != idempotencyKey("m1", "ok", 1) || c.sent[0].text != "ok" {
 		t.Fatalf("sent=%+v", c.sent)
 	}
-	// a second reply in the same turn must not reuse the idempotency key
+	// A second, different reply in the same turn must not reuse the key.
 	_ = p.Send(context.Background(), rc, "more")
 	if c.sent[1].key == c.sent[0].key {
 		t.Fatal("idempotency key reused")
@@ -148,7 +149,7 @@ func TestChunking(t *testing.T) {
 		if !strings.HasPrefix(s.text, "[") || !strings.Contains(s.text, "/") || !strings.Contains(s.text, " sha256:") {
 			t.Fatalf("no prefix: %q", s.text[:20])
 		}
-		if s.key != "m-"+itoa(i+1) {
+		if s.key != idempotencyKey("m", s.text, i+1) {
 			t.Fatalf("key %q", s.key)
 		}
 		sb.WriteString(s.text[strings.Index(s.text, "] ")+2:])
@@ -160,8 +161,6 @@ func TestChunking(t *testing.T) {
 		t.Fatalf("short text must not be prefixed: %v", got)
 	}
 }
-
-func itoa(i int) string { return strings.TrimSpace(strings.Repeat(" ", 0) + string(rune('0'+i))) }
 
 func TestStopEndsPolling(t *testing.T) {
 	p := newPlatform(&l1Client{}, &l1Acker{}, map[string]any{"poll_interval": "10ms"})

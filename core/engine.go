@@ -1394,6 +1394,19 @@ func (e *Engine) checkRateLimit(msg *Message) bool {
 	return e.rateLimiter.Allow(key)
 }
 
+// finishTurnIfSupported reports the end of a turn to platforms implementing
+// TurnFinisher. Agent turns go through processInteractiveEvents, which calls
+// FinishTurn exactly once; early exits that answer the user without running an
+// agent (rate limit, queue full, banned word, ...) must call this so
+// message-bus platforms ack the inbound message instead of holding it in
+// flight forever (which meant full redelivery of the batch after a restart).
+// ok=true means "the turn produced its final reply"; the turn did not fail.
+func finishTurnIfSupported(ctx context.Context, p Platform, replyCtx any, ok bool) {
+	if tf, isFinisher := p.(TurnFinisher); isFinisher {
+		tf.FinishTurn(ctx, replyCtx, ok)
+	}
+}
+
 // SetStreamPreviewCfg configures the streaming preview behavior.
 func (e *Engine) SetStreamPreviewCfg(cfg StreamPreviewCfg) {
 	e.streamPreview = cfg
@@ -3058,6 +3071,11 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		slog.Info("message rate limited",
 			"session", msg.SessionKey, "user_id", msg.UserID, "user", msg.UserName)
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgRateLimited))
+		// The turn ends here (the user got its reply), but no agent turn will
+		// ever run, so processInteractiveEvents will not call FinishTurn.
+		// Message-bus platforms (a2a) otherwise keep the inbound message in
+		// flight and redeliver the whole batch after a restart.
+		finishTurnIfSupported(e.ctx, p, msg.ReplyCtx, true)
 		return
 	}
 
@@ -3424,6 +3442,9 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	if len(state.pendingMessages) >= e.maxQueuedMessages {
 		depth := len(state.pendingMessages)
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), depth))
+		// Rejected = this turn is over and answered. Settle it explicitly so
+		// TurnFinisher platforms ack instead of redelivering after a restart.
+		finishTurnIfSupported(e.ctx, p, msg.ReplyCtx, true)
 		return true // handled: queue-full reply sent
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{

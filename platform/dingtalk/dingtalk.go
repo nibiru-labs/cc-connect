@@ -201,6 +201,11 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	// This ensures the bot stays connected even after long periods of silence.
 	go func() {
 		defer slog.Info("dingtalk: stream runner exited")
+		// failedAttempts counts consecutive failed Start() calls (errors or
+		// panics) since the last successful one; it drives the exponential
+		// backoff and is reset to 0 as soon as Start() returns nil.
+		failedAttempts := 0
+		var outageStart time.Time
 		for {
 			select {
 			case <-ctx.Done():
@@ -208,29 +213,90 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 			default:
 			}
 
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						slog.Error("dingtalk: stream panic recovered, will reconnect",
-							"panic", r)
-					}
-				}()
-				if err := p.streamClient.Start(ctx); err != nil {
-					slog.Warn("dingtalk: stream disconnected, reconnecting", "error", err)
-				}
-			}()
+			startErr, panicVal := p.runStreamOnce(ctx)
 
-			// Brief pause before reconnecting to avoid tight loop on persistent failures.
+			// Healthy connection: keep the old 3s spin (Start returns nil
+			// immediately while connected). Outage: back off exponentially so a
+			// long outage does not hammer the gateway.
+			delay := streamHealthyInterval
+			switch {
+			case startErr != nil || panicVal != nil:
+				if failedAttempts == 0 {
+					outageStart = time.Now()
+				}
+				failedAttempts++
+				next := streamReconnectDelay(failedAttempts)
+				if panicVal != nil {
+					slog.Error("dingtalk: stream panic recovered, will reconnect",
+						"panic", panicVal, "attempt", failedAttempts, "next_retry", next)
+				} else {
+					// Message text is unchanged on purpose: downstream stats key
+					// off it. Only structured fields were added.
+					slog.Warn("dingtalk: stream disconnected, reconnecting",
+						"error", startErr, "attempt", failedAttempts, "next_retry", next)
+				}
+				delay = next
+			default:
+				if failedAttempts > 0 {
+					slog.Info("dingtalk: stream reconnected",
+						"client_id", p.clientID,
+						"failed_attempts", failedAttempts,
+						"downtime", time.Since(outageStart))
+					failedAttempts = 0
+					outageStart = time.Time{}
+				}
+			}
+
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(3 * time.Second):
+			case <-time.After(delay):
 			}
 		}
 	}()
 
 	slog.Info("dingtalk: stream connected", "client_id", p.clientID)
 	return nil
+}
+
+const (
+	// streamHealthyInterval is the poll interval used while the stream is
+	// healthy. The SDK's Start() returns nil immediately when already
+	// connected, so the loop spins at this rate by design.
+	streamHealthyInterval = 3 * time.Second
+	// streamReconnectBase is the delay before the first reconnect attempt;
+	// streamReconnectMax caps the exponential growth.
+	streamReconnectBase = 3 * time.Second
+	streamReconnectMax  = 60 * time.Second
+)
+
+// streamReconnectDelay returns how long to wait before retrying after
+// consecutiveFailures failed Start() calls: 3s, 6s, 12s, ... capped at 60s.
+// It returns 0 when there was no failure (nothing to back off from).
+func streamReconnectDelay(consecutiveFailures int) time.Duration {
+	if consecutiveFailures <= 0 {
+		return 0
+	}
+	d := streamReconnectBase
+	for i := 1; i < consecutiveFailures; i++ {
+		d *= 2
+		if d >= streamReconnectMax {
+			return streamReconnectMax
+		}
+	}
+	return d
+}
+
+// runStreamOnce runs one Start() attempt, converting a panic into a return
+// value so the restart loop never has to re-defer across iterations.
+func (p *Platform) runStreamOnce(ctx context.Context) (err error, panicVal any) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = nil
+			panicVal = r
+		}
+	}()
+	return p.streamClient.Start(ctx), nil
 }
 
 // onRawMessage is the entry point for incoming messages. It receives the raw

@@ -61,7 +61,6 @@ type Platform struct {
 	mu       sync.Mutex
 	inflight map[string]bool
 	done     map[string]time.Time
-	replies  map[string]int // successful Reply/Send count per first message id
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 }
@@ -119,7 +118,7 @@ func newPlatform(c Client, a Acker, opts map[string]any) *Platform {
 	}
 	return &Platform{
 		client: c, acker: a, allow: allow, interval: interval, maxChunk: maxChunk,
-		inflight: map[string]bool{}, done: map[string]time.Time{}, replies: map[string]int{},
+		inflight: map[string]bool{}, done: map[string]time.Time{},
 	}
 }
 
@@ -278,24 +277,26 @@ func (p *Platform) send(ctx context.Context, replyCtx any, content string) error
 	first := rc.MessageIDs[0]
 	replyTo := rc.MessageIDs[len(rc.MessageIDs)-1]
 
-	p.mu.Lock()
-	n := p.replies[first]
-	p.mu.Unlock()
-
 	chunks := splitChunks(content, p.maxChunk)
 	for i, text := range chunks {
-		idem := fmt.Sprintf("%s-%d", first, i+1)
-		if n > 0 {
-			idem = fmt.Sprintf("%s-r%d-%d", first, n, i+1)
-		}
-		if err := p.client.SendReply(ctx, replyTo, idem, text); err != nil {
+		if err := p.client.SendReply(ctx, replyTo, idempotencyKey(first, text, i+1), text); err != nil {
 			return fmt.Errorf("a2a: send chunk %d/%d: %w", i+1, len(chunks), err)
 		}
 	}
-	p.mu.Lock()
-	p.replies[first]++
-	p.mu.Unlock()
 	return nil
+}
+
+// idempotencyKey builds the outbound key for one chunk of a reply:
+// "<first inbound message id>-h<sha256(chunk)[0:12]>-<chunk index, 1-based>",
+// e.g. "am-abc-h1a2b3c4d5e6f-1".
+//
+// The key is derived purely from content, never from in-memory counters, so it
+// is stable across restarts: re-sending the same chunk after a crash produces
+// the same key and the bus can safely deduplicate it, while two different
+// replies to the same inbound message never collapse onto one key.
+func idempotencyKey(firstID, chunk string, index int) string {
+	sum := sha256.Sum256([]byte(chunk))
+	return fmt.Sprintf("%s-h%s-%d", firstID, hex.EncodeToString(sum[:])[:12], index)
 }
 
 // FinishTurn implements core.TurnFinisher. The engine calls it exactly once

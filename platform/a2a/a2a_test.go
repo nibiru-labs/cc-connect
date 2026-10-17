@@ -256,7 +256,7 @@ func TestPingFromOthersOnlyAcked(t *testing.T) {
 	}
 }
 
-// 规格: Reply/Send 分块 — max_chunk 默认 6000 字节, rune 边界, 前缀 [i/n sha256:<全文前12位>], 键 <message_id>-<i>
+// 规格: Reply/Send 分块 — max_chunk 默认 6000 字节, rune 边界, 前缀 [i/n sha256:<全文前12位>], 键 <message_id>-h<分片sha256前12位>-<i>
 func TestSpecChunking(t *testing.T) {
 	text := strings.Repeat("你好世界", 1200) // 4800 runes = 14400 bytes
 	sum := sha256.Sum256([]byte(text))
@@ -286,7 +286,7 @@ func TestSpecChunking(t *testing.T) {
 		if len(body) > 6000 {
 			t.Fatalf("chunk %d body %d bytes > 6000", i, len(body))
 		}
-		if s.Key != fmt.Sprintf("m1-%d", i+1) {
+		if s.Key != idempotencyKey("m1", s.Text, i+1) {
 			t.Fatalf("chunk %d key=%q", i, s.Key)
 		}
 		if s.ReplyTo != "m1" {

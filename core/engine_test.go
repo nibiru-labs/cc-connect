@@ -526,6 +526,90 @@ func TestProcessInteractiveEvents_FinishTurnFailedWhenSendFails(t *testing.T) {
 	}
 }
 
+// Regression (rate limit + queue full): both paths answer the user and return
+// before any agent turn runs, so processInteractiveEvents never fires.
+// Without an explicit FinishTurn the inbound message stayed in-flight on the
+// message bus (a2a) and the whole batch was redelivered after a restart.
+func TestReceiveMessage_RateLimitedTurnFinishesOnce(t *testing.T) {
+	p := &stubTurnFinisherPlatform{stubPlatformEngine: stubPlatformEngine{n: "a2a"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetRateLimitCfg(RateLimitCfg{Window: time.Minute, MaxMessages: 1})
+
+	const key = "a2a:conv"
+	// Burn the single token of the window so the message below is rejected.
+	if !e.checkRateLimit(&Message{SessionKey: key, UserID: "u1"}) {
+		t.Fatal("precondition: first message should pass the rate limit")
+	}
+
+	msg := &Message{
+		SessionKey: key,
+		Platform:   "a2a",
+		MessageID:  "m-2",
+		UserID:     "u1",
+		UserName:   "u1",
+		Content:    "second",
+		ReplyCtx:   "ctx-2",
+	}
+	e.ReceiveMessage(p, msg)
+
+	// The user still sees the rate-limit notice...
+	sent := p.getSent()
+	if len(sent) != 1 || !strings.Contains(sent[0], e.i18n.T(MsgRateLimited)) {
+		t.Fatalf("platform replies = %#v, want one rate-limit notice", sent)
+	}
+	// ...and the bus is told the turn ended, exactly once, successfully.
+	fins := p.finishes()
+	if len(fins) != 1 {
+		t.Fatalf("finishes = %#v, want exactly one FinishTurn for the rate-limited turn", fins)
+	}
+	if fins[0].replyCtx != "ctx-2" || !fins[0].ok {
+		t.Fatalf("finish = %#v, want ok=true for replyCtx ctx-2", fins[0])
+	}
+}
+
+func TestQueueMessageForBusySession_QueueFullFinishesTurn(t *testing.T) {
+	p := &stubTurnFinisherPlatform{stubPlatformEngine: stubPlatformEngine{n: "a2a"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "a2a:conv"
+	state := &interactiveState{
+		agentSession: newControllableSession("s-qfull"),
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	for i := 0; i < defaultMaxQueuedMessages; i++ {
+		msg := &Message{SessionKey: key, Content: fmt.Sprintf("msg-%d", i), ReplyCtx: fmt.Sprintf("ctx-%d", i)}
+		if !e.queueMessageForBusySession(p, msg, key) {
+			t.Fatalf("msg-%d should have been queued", i)
+		}
+	}
+	// Accepted messages still belong to the running turn: no finish yet.
+	if fins := p.finishes(); len(fins) != 0 {
+		t.Fatalf("finishes after queueing = %#v, want none", fins)
+	}
+
+	overflow := &Message{SessionKey: key, Content: "msg-overflow", ReplyCtx: "ctx-overflow"}
+	if !e.queueMessageForBusySession(p, overflow, key) {
+		t.Fatal("overflow message should be handled (queue-full reply), not dropped silently")
+	}
+
+	sent := p.getSent()
+	if len(sent) != defaultMaxQueuedMessages+1 ||
+		!strings.Contains(sent[len(sent)-1], fmt.Sprintf(e.i18n.T(MsgQueueFull), defaultMaxQueuedMessages)) {
+		t.Fatalf("platform replies = %#v, want queue-full notice last", sent)
+	}
+	fins := p.finishes()
+	if len(fins) != 1 {
+		t.Fatalf("finishes = %#v, want exactly one FinishTurn for the rejected message", fins)
+	}
+	if fins[0].replyCtx != "ctx-overflow" || !fins[0].ok {
+		t.Fatalf("finish = %#v, want ok=true for replyCtx ctx-overflow", fins[0])
+	}
+}
+
 type stubAskQuestionRichCardPlatform struct {
 	stubCardPlatform
 }
