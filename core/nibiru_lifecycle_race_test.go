@@ -10,13 +10,48 @@ import (
 )
 
 type rotationRaceMessageSession struct {
-	*controllableAgentSession
-	sent chan string
+	sessionID string
+	events    chan Event
+	closed    chan struct{}
+	alive     atomic.Bool
+	closeOnce sync.Once
+	sent      chan string
 }
 
 func (s *rotationRaceMessageSession) Send(prompt, _ string, _ []ImageAttachment, _ []FileAttachment) error {
-	s.sent <- prompt
-	s.events <- Event{Type: EventResult, Content: "handled", Done: true}
+	select {
+	case s.sent <- prompt:
+	case <-s.closed:
+		return context.Canceled
+	}
+	select {
+	case s.events <- Event{Type: EventResult, Content: "handled", Done: true}:
+		return nil
+	case <-s.closed:
+		return context.Canceled
+	}
+}
+
+func newRotationRaceMessageSession(id string) *rotationRaceMessageSession {
+	s := &rotationRaceMessageSession{
+		sessionID: id,
+		events:    make(chan Event, 4),
+		closed:    make(chan struct{}),
+		sent:      make(chan string, 4),
+	}
+	s.alive.Store(true)
+	return s
+}
+
+func (s *rotationRaceMessageSession) RespondPermission(string, PermissionResult) error { return nil }
+func (s *rotationRaceMessageSession) Events() <-chan Event                             { return s.events }
+func (s *rotationRaceMessageSession) CurrentSessionID() string                         { return s.sessionID }
+func (s *rotationRaceMessageSession) Alive() bool                                      { return s.alive.Load() }
+func (s *rotationRaceMessageSession) Close() error {
+	s.closeOnce.Do(func() {
+		s.alive.Store(false)
+		close(s.closed)
+	})
 	return nil
 }
 
@@ -50,7 +85,7 @@ func TestReceiveMessage_RotationCommitDoesNotDropInboundMessage(t *testing.T) {
 	releaseRecall := func() { releaseOnce.Do(func() { close(p.recallRelease) }) }
 	t.Cleanup(releaseRecall)
 
-	nextSession := newControllableSession("new-session")
+	nextSession := newRotationRaceMessageSession("new-session")
 	started := make(chan struct{}, 1)
 	agent := &controllableAgent{startSessionFn: func(context.Context, string) (AgentSession, error) {
 		started <- struct{}{}
@@ -120,17 +155,22 @@ func TestReceiveMessage_RotationCommitDoesNotDropInboundMessage(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("accepted inbound message did not start the replacement session")
 	}
+	select {
+	case prompt := <-nextSession.sent:
+		if !strings.Contains(prompt, "continue after rotation") {
+			t.Fatalf("replacement session received unexpected prompt %q", prompt)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("replacement session did not receive the accepted inbound message")
+	}
+	waitForRotationRaceSessionUnlock(t, session)
 }
 
 func TestReceiveMessage_RotationCommitPreservesContendingInboundMessages(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	oldBase := newControllableSession("old-session")
 	oldSession := &rotateSession{controllableAgentSession: oldBase, reply: "handoff summary"}
-	newBase := newControllableSession("new-session")
-	newSession := &rotationRaceMessageSession{
-		controllableAgentSession: newBase,
-		sent:                     make(chan string, 4),
-	}
+	newSession := newRotationRaceMessageSession("new-session")
 	started := make(chan struct{}, 1)
 	agent := &controllableAgent{startSessionFn: func(context.Context, string) (AgentSession, error) {
 		started <- struct{}{}
@@ -257,5 +297,17 @@ func TestReceiveMessage_RotationCommitPreservesContendingInboundMessages(t *test
 		if strings.Contains(reply, "Previous request still processing") {
 			t.Fatalf("a contending message was rejected after rotation: %q", reply)
 		}
+	}
+	waitForRotationRaceSessionUnlock(t, session)
+}
+
+func waitForRotationRaceSessionUnlock(t *testing.T, session *Session) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for session.Busy() {
+		if time.Now().After(deadline) {
+			t.Fatal("replacement turn did not release the session lock")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

@@ -3268,6 +3268,30 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			}
 			return
 		}
+
+		// Rotation can remove the interactive state after this turn's TryLock
+		// fails but before queueMessageForBusySession looks it up. If commitRotate
+		// released the lock in that window, take it and process this message as a
+		// fresh turn instead of reporting PreviousProcessing.
+		if g, ok := session.TryLock(); ok {
+			lockGen = g
+			goto sessionLocked
+		}
+
+		// Another inbound turn may have won the released lock before registering
+		// its replacement state. Restore a queue target and retry once so this
+		// message joins that turn rather than being dropped during state handoff.
+		e.ensureInteractiveStateForQueueing(interactiveKey, p, msg.ReplyCtx)
+		if e.queueMessageForBusySession(p, msg, interactiveKey) {
+			if g, ok := session.TryLock(); ok {
+				go e.drainOrphanedQueue(session, sessions, interactiveKey, agent, resolvedWorkspace, g)
+			}
+			return
+		}
+		if g, ok := session.TryLock(); ok {
+			lockGen = g
+			goto sessionLocked
+		}
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 		return
 	}
