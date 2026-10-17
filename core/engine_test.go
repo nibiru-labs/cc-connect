@@ -14497,6 +14497,142 @@ func TestUnsolicitedReader_ResetsIdleCloseOnEventResult(t *testing.T) {
 	state.mu.Unlock()
 }
 
+// TestUnsolicitedReader_ActiveTurnKeepsSessionAlivePastIdleDeadline covers an
+// unsolicited turn that begins after the idle timer is armed and remains
+// active beyond that timer's deadline. The result must then start a fresh
+// idle interval.
+func TestUnsolicitedReader_ActiveTurnKeepsSessionAlivePastIdleDeadline(t *testing.T) {
+	const idleTimeout = 160 * time.Millisecond
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("unsol-idle-active")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+	e.SetAgentSessionIdleTimeout(idleTimeout)
+
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive("test:ch_idle_active:u1")
+	state := &interactiveState{
+		agentSession:     sess,
+		platform:         p,
+		replyCtx:         "ctx",
+		eventsNeedResync: false,
+	}
+	key := "test:ch_idle_active:u1"
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	e.scheduleAgentSessionIdleClose(key, state)
+	e.startUnsolicitedReader(state, session, sessions, key, "")
+	defer e.stopUnsolicitedReader(state)
+
+	// Permission requests are synchronously surfaced to the platform, which
+	// gives the test a deterministic signal that the reader began this turn.
+	sess.events <- Event{Type: EventPermissionRequest, RequestID: "active-1", ToolName: "Bash"}
+	if sent := waitForPlatformSend(p, 1, time.Second); len(sent) == 0 {
+		t.Fatal("timed out waiting for unsolicited turn to become active")
+	}
+	time.Sleep(idleTimeout)
+	select {
+	case <-sess.closed:
+		t.Fatal("idle timeout closed the session while an unsolicited turn was active")
+	default:
+	}
+
+	state.mu.Lock()
+	oldToken := state.agentSessionIdleToken
+	state.mu.Unlock()
+	sess.events <- Event{Type: EventResult, Content: "background turn complete", Done: true}
+	if sent := waitForPlatformSend(p, 2, time.Second); len(sent) < 2 {
+		t.Fatal("timed out waiting for unsolicited result")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		state.mu.Lock()
+		newToken := state.agentSessionIdleToken
+		state.mu.Unlock()
+		if newToken != 0 && newToken != oldToken {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	state.mu.Lock()
+	newToken := state.agentSessionIdleToken
+	state.mu.Unlock()
+	if newToken == 0 || newToken == oldToken {
+		t.Fatal("EventResult did not arm a fresh idle timeout")
+	}
+
+	time.Sleep(idleTimeout / 2)
+	select {
+	case <-sess.closed:
+		t.Fatal("fresh idle timeout closed the session before its full interval elapsed")
+	default:
+	}
+	select {
+	case <-sess.closed:
+	case <-time.After(2 * idleTimeout):
+		t.Fatal("fresh idle timeout did not close the now-idle session")
+	}
+}
+
+// TestUnsolicitedReader_ReaderStartedBeforeIdleScheduleDoesNotArmDuringTurn
+// covers an event arriving after the reader starts but before the caller arms
+// the timer. This is the ordering used after a clean foreground turn.
+func TestUnsolicitedReader_ReaderStartedBeforeIdleScheduleDoesNotArmDuringTurn(t *testing.T) {
+	const idleTimeout = 160 * time.Millisecond
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("unsol-idle-order")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+	e.SetAgentSessionIdleTimeout(idleTimeout)
+
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive("test:ch_idle_order:u1")
+	state := &interactiveState{
+		agentSession:     sess,
+		platform:         p,
+		replyCtx:         "ctx",
+		eventsNeedResync: false,
+	}
+	key := "test:ch_idle_order:u1"
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	e.startUnsolicitedReader(state, session, sessions, key, "")
+	defer e.stopUnsolicitedReader(state)
+	sess.events <- Event{Type: EventPermissionRequest, RequestID: "active-2", ToolName: "Bash"}
+	if sent := waitForPlatformSend(p, 1, time.Second); len(sent) == 0 {
+		t.Fatal("timed out waiting for unsolicited turn to become active")
+	}
+
+	// The reader has already claimed the background turn. Scheduling at this
+	// point must observe that shared state and leave no timer armed.
+	e.scheduleAgentSessionIdleClose(key, state)
+	time.Sleep(idleTimeout)
+	select {
+	case <-sess.closed:
+		t.Fatal("timer scheduled after reader startup closed an active unsolicited turn")
+	default:
+	}
+
+	sess.events <- Event{Type: EventResult, Content: "ordered turn complete", Done: true}
+	if sent := waitForPlatformSend(p, 2, time.Second); len(sent) < 2 {
+		t.Fatal("timed out waiting for unsolicited result")
+	}
+	select {
+	case <-sess.closed:
+		t.Fatal("session closed immediately after EventResult instead of using a fresh idle interval")
+	case <-time.After(idleTimeout / 2):
+	}
+	select {
+	case <-sess.closed:
+	case <-time.After(2 * idleTimeout):
+		t.Fatal("fresh idle timeout did not close the now-idle session")
+	}
+}
+
 // TestUnsolicitedReader_StopsOnCancel verifies that stopUnsolicitedReader
 // cleanly stops the reader goroutine and waits for it to exit.
 func TestUnsolicitedReader_StopsOnCancel(t *testing.T) {
