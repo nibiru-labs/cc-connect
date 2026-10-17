@@ -290,6 +290,28 @@ func TestRosterTransferRejectsLooseNumbersAndOversizedEnvelopes(t *testing.T) {
 	}
 }
 
+func TestRosterTransferRejectsOversizedEscapedLateTypeBeforeModel(t *testing.T) {
+	for _, typ := range []string{rosterManifestType, rosterChunkType} {
+		name := strings.TrimPrefix(typ, "xstation.roster.")
+		t.Run(name, func(t *testing.T) {
+			body := `{"note":"` + strings.Repeat("x", rosterBodyLimit) + `","type":"\u0078` + strings.TrimPrefix(typ, "x") + `"}`
+			if len(body) <= rosterBodyLimit {
+				t.Fatalf("test body is %d bytes, want larger than %d", len(body), rosterBodyLimit)
+			}
+			if offset := strings.Index(body, `"type"`); offset <= rosterBodyLimit {
+				t.Fatalf("type field starts at %d, want after %d-byte limit", offset, rosterBodyLimit)
+			}
+
+			p, _ := newRosterReceiverPlatform(t, filepath.Join(t.TempDir(), "roster-state.json"), time.Now)
+			handler := &recorder{}
+			p.dispatch(context.Background(), handler.handle, in("oversized-"+name, "c1", "saka", body))
+			if got := handler.all(); len(got) != 0 {
+				t.Fatalf("oversized escaped roster transfer reached model: got %d messages", len(got))
+			}
+		})
+	}
+}
+
 func TestRosterTransferRejectsTamperedHashAndInvalidRosterBeforeHandler(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

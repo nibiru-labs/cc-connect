@@ -180,11 +180,9 @@ func sniffRosterType(text string) (string, bool) {
 			}
 		}
 	}
-	// The type may be a later root field in an oversized envelope. Scan only
-	// candidates with a transfer marker, and inspect the root JSON field so a
-	// normal message that merely mentions the protocol remains ordinary text.
-	if len(text) > rosterBodyLimit &&
-		(strings.Contains(text, rosterManifestType) || strings.Contains(text, rosterChunkType)) {
+	// The type may be a later root field in an oversized envelope, with its
+	// value encoded using JSON escapes. Inspect the root object directly.
+	if len(text) > rosterBodyLimit {
 		return sniffLargeRosterRootType(text)
 	}
 	return found, found != ""
