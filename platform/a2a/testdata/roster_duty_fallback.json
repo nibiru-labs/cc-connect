@@ -1,0 +1,74 @@
+{
+  "upstream": {
+    "repository": "nibiru-labs/nibiru",
+    "file": "tools/a2a/cloud/a2a_cloud.py",
+    "commit": "41487a0dcf7975b297c541a1addb237d3de4d23c",
+    "path": "broadcast_targets -> broadcast_issuer_id -> unique_coordinator_id"
+  },
+  "cases": [
+    {
+      "name": "non-member issuer rejects multiple coordinators",
+      "expected_issuer": "trusted-sender",
+      "python_valid": false,
+      "roster": {
+        "type": "xstation.roster.v1",
+        "version": 19,
+        "issued_by": "trusted-sender",
+        "approved_by": "user",
+        "members": [
+          {"id": "sakura", "name": "sakura", "full_name": "sakura-claude-gocc", "duty": "coordinator"},
+          {"id": "anu", "name": "anu", "full_name": "anu-claude-cloud", "duty": "coordinator"}
+        ]
+      }
+    },
+    {
+      "name": "non-member issuer rejects malformed duty",
+      "expected_issuer": "trusted-sender",
+      "python_valid": false,
+      "roster": {
+        "type": "xstation.roster.v1",
+        "version": 19,
+        "issued_by": "trusted-sender",
+        "approved_by": "user",
+        "members": [
+          {"id": "sakura", "name": "sakura", "full_name": "sakura-claude-gocc"},
+          {"id": "anu", "name": "anu", "full_name": "anu-claude-cloud", "duty": 42}
+        ]
+      }
+    },
+    {
+      "name": "retired issuer still uses non-member duty fallback",
+      "expected_issuer": "retired-agent",
+      "python_valid": false,
+      "roster": {
+        "type": "xstation.roster.v1",
+        "version": 19,
+        "issued_by": "retired-agent",
+        "approved_by": "user",
+        "members": [
+          {"id": "coordinator-a", "name": "coordinator-a", "full_name": "coordinator-a-claude-gocc", "duty": "coordinator"},
+          {"id": "coordinator-b", "name": "coordinator-b", "full_name": "coordinator-b-claude-cloud", "duty": "coordinator"}
+        ],
+        "retired": [
+          {"id": "retired-agent", "name": "retired-agent", "full_name": "retired-agent-claude-old", "retired_at": "2026-10-01", "reason": "retired", "decision": "approved"}
+        ]
+      }
+    },
+    {
+      "name": "member issuer returns before inspecting duties",
+      "expected_issuer": "saka",
+      "python_valid": true,
+      "roster": {
+        "type": "xstation.roster.v1",
+        "version": 19,
+        "issued_by": "saka",
+        "approved_by": "user",
+        "members": [
+          {"id": "saka", "name": "saka", "full_name": "saka-claude-gocc", "duty": 42},
+          {"id": "coordinator-a", "name": "coordinator-a", "full_name": "coordinator-a-claude-gocc", "duty": "coordinator"},
+          {"id": "coordinator-b", "name": "coordinator-b", "full_name": "coordinator-b-claude-cloud", "duty": "coordinator"}
+        ]
+      }
+    }
+  ]
+}
