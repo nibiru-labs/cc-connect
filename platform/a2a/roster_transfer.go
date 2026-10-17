@@ -38,6 +38,7 @@ const (
 	rosterManifestType     = "xstation.roster.manifest.v1"
 	rosterChunkType        = "xstation.roster.chunk.v1"
 	rosterLegacyRosterType = "xstation.roster.v1"
+	grokRosterAuthorityRef = "nibiru#1301 comment6233496788"
 )
 
 var (
@@ -65,15 +66,18 @@ type rosterReceiveResult struct {
 }
 
 type rosterPiece struct {
-	kind        string
-	version     int64
-	issuer      string
-	hash        string
-	total       int
-	index       int
-	text        string
-	payloadSize int64
-	body        string
+	kind            string
+	version         int64
+	issuer          string
+	hash            string
+	total           int
+	index           int
+	text            string
+	payloadSize     int64
+	body            string
+	approvedBy      string
+	authorityRef    string
+	hasAuthorityRef bool
 }
 
 type rosterReceiver struct {
@@ -256,6 +260,18 @@ func skipJSONValueAfterToken(d *json.Decoder, token any) error {
 	return nil
 }
 
+func validateRosterApprovalMetadata(value map[string]any) error {
+	approver, _ := value["approved_by"].(string)
+	authorityRef, hasAuthorityRef := value["authority_ref"]
+	if approver == "user" && !hasAuthorityRef {
+		return nil
+	}
+	if approver == "grok" && authorityRef == grokRosterAuthorityRef {
+		return nil
+	}
+	return errors.New("roster approved_by / authority_ref combination is not supported")
+}
+
 func parseRosterPiece(body string) (rosterPiece, error) {
 	if len(body) > rosterBodyLimit {
 		return rosterPiece{}, fmt.Errorf("roster message exceeds %d bytes", rosterBodyLimit)
@@ -293,9 +309,11 @@ func parseRosterPiece(body string) (rosterPiece, error) {
 	}
 	piece := rosterPiece{kind: typ, version: version, issuer: issuer, hash: sourceHash, body: body}
 	if typ == rosterManifestType {
-		if obj["approved_by"] != "user" {
-			return rosterPiece{}, errors.New("manifest approved_by must be user")
+		if err := validateRosterApprovalMetadata(obj); err != nil {
+			return rosterPiece{}, fmt.Errorf("invalid manifest approval metadata: %w", err)
 		}
+		piece.approvedBy, _ = obj["approved_by"].(string)
+		piece.authorityRef, piece.hasAuthorityRef = obj["authority_ref"].(string)
 		if obj["payload_format"] != rosterPayloadFormat {
 			return rosterPiece{}, errors.New("unsupported roster payload_format")
 		}
@@ -730,8 +748,16 @@ func reassembleRosterTransfer(authenticatedSender, expectedIssuer, manifestBody 
 	if err != nil {
 		return nil, err
 	}
-	if roster["type"] != rosterLegacyRosterType || version != manifest.version || roster["issued_by"] != manifest.issuer || roster["approved_by"] != "user" {
+	approvedBy, _ := roster["approved_by"].(string)
+	if roster["type"] != rosterLegacyRosterType || version != manifest.version || roster["issued_by"] != manifest.issuer || approvedBy != manifest.approvedBy {
 		return nil, errors.New("reconstructed roster header does not match manifest")
+	}
+	if err := validateRosterApprovalMetadata(roster); err != nil {
+		return nil, fmt.Errorf("reconstructed roster has invalid approval metadata: %w", err)
+	}
+	authorityRef, hasAuthorityRef := roster["authority_ref"]
+	if hasAuthorityRef != manifest.hasAuthorityRef || (hasAuthorityRef && authorityRef != manifest.authorityRef) {
+		return nil, errors.New("reconstructed roster authority_ref does not match manifest")
 	}
 	manifestCharter, manifestHasCharter := manifestEnvelopeCharter(manifestBody)
 	rosterCharter, rosterHasCharter := roster["charter"]
@@ -758,8 +784,11 @@ func manifestEnvelopeCharter(body string) (any, bool) {
 }
 
 func validateRoster(roster map[string]any, expectedIssuer string) error {
-	if roster["type"] != rosterLegacyRosterType || roster["approved_by"] != "user" {
-		return errors.New("type must be xstation.roster.v1 and approved_by must be user")
+	if roster["type"] != rosterLegacyRosterType {
+		return errors.New("type must be xstation.roster.v1")
+	}
+	if err := validateRosterApprovalMetadata(roster); err != nil {
+		return err
 	}
 	if _, err := positiveJSONInteger(roster["version"], "version"); err != nil {
 		return err

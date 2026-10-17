@@ -44,8 +44,31 @@ func makeTestRoster(t *testing.T, issuer string, version int64, note string) []b
 	return raw
 }
 
+func updateRosterApprovalMetadata(t *testing.T, raw []byte, approvedBy, authorityRef string, hasAuthorityRef bool) []byte {
+	t.Helper()
+	var roster map[string]any
+	if err := json.Unmarshal(raw, &roster); err != nil {
+		t.Fatal(err)
+	}
+	roster["approved_by"] = approvedBy
+	if hasAuthorityRef {
+		roster["authority_ref"] = authorityRef
+	} else {
+		delete(roster, "authority_ref")
+	}
+	updated, err := json.Marshal(roster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return updated
+}
+
 func makeRosterTransferBodies(t *testing.T, raw []byte, issuer string, version int64, partBytes int) (string, []string) {
 	t.Helper()
+	var source map[string]any
+	if err := json.Unmarshal(raw, &source); err != nil {
+		t.Fatal(err)
+	}
 	sum := sha256.Sum256(raw)
 	digest := hex.EncodeToString(sum[:])
 	var chunks []string
@@ -56,17 +79,21 @@ func makeRosterTransferBodies(t *testing.T, raw []byte, issuer string, version i
 		}
 		chunks = append(chunks, string(raw[offset:end]))
 	}
-	manifest, err := json.Marshal(map[string]any{
+	manifestValue := map[string]any{
 		"type":           rosterManifestType,
 		"version":        version,
 		"issued_by":      issuer,
-		"approved_by":    "user",
+		"approved_by":    source["approved_by"],
 		"payload_format": rosterPayloadFormat,
 		"source_sha256":  digest,
 		"payload_sha256": digest,
 		"payload_bytes":  len(raw),
 		"chunks":         len(chunks),
-	})
+	}
+	if authorityRef, exists := source["authority_ref"]; exists {
+		manifestValue["authority_ref"] = authorityRef
+	}
+	manifest, err := json.Marshal(manifestValue)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,6 +121,14 @@ func makeRosterTransferBodies(t *testing.T, raw []byte, issuer string, version i
 		t.Fatalf("test manifest body is %d bytes", len(manifest))
 	}
 	return string(manifest), bodies
+}
+
+func rosterStoredChunks(chunks []string) map[int]rosterStoredChunk {
+	stored := make(map[int]rosterStoredChunk, len(chunks))
+	for index, body := range chunks {
+		stored[index] = rosterStoredChunk{Body: body, MessageID: fmt.Sprintf("chunk-%d", index)}
+	}
+	return stored
 }
 
 func TestRosterTransferReassemblesOutOfOrderAcrossRestartAndDeduplicates(t *testing.T) {
@@ -156,6 +191,81 @@ func TestRosterTransferKeepsOrdinaryAndLegacyMessagesCompatible(t *testing.T) {
 	got := r.all()
 	if len(got) != 2 || got[0].Content != legacy || got[1].Content != "hello" {
 		t.Fatalf("legacy/ordinary messages changed path: %#v", got)
+	}
+}
+
+func TestRosterApprovalMetadataAllowsLegacyAndFixedGrokOnly(t *testing.T) {
+	tests := []struct {
+		name            string
+		approvedBy      string
+		authorityRef    string
+		hasAuthorityRef bool
+		wantValid       bool
+	}{
+		{name: "legacy user", approvedBy: "user", wantValid: true},
+		{name: "fixed grok", approvedBy: "grok", authorityRef: grokRosterAuthorityRef, hasAuthorityRef: true, wantValid: true},
+		{name: "unknown approver", approvedBy: "saka", authorityRef: grokRosterAuthorityRef, hasAuthorityRef: true},
+		{name: "grok missing reference", approvedBy: "grok"},
+		{name: "grok wrong reference", approvedBy: "grok", authorityRef: "nibiru#1301", hasAuthorityRef: true},
+		{name: "user with reference", approvedBy: "user", authorityRef: grokRosterAuthorityRef, hasAuthorityRef: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := makeTestRoster(t, "saka", 14, "approval metadata")
+			raw = updateRosterApprovalMetadata(t, raw, tc.approvedBy, tc.authorityRef, tc.hasAuthorityRef)
+			value, err := decodeUniqueJSON(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			roster := value.(map[string]any)
+			validationErr := validateRoster(roster, "saka")
+			if (validationErr == nil) != tc.wantValid {
+				t.Fatalf("validateRoster error = %v, want valid=%t", validationErr, tc.wantValid)
+			}
+
+			manifest, _ := makeRosterTransferBodies(t, raw, "saka", 14, 1800)
+			_, manifestErr := parseRosterPiece(manifest)
+			if (manifestErr == nil) != tc.wantValid {
+				t.Fatalf("parseRosterPiece error = %v, want valid=%t", manifestErr, tc.wantValid)
+			}
+		})
+	}
+}
+
+func TestRosterTransferReassemblesFixedGrokApprovalMetadata(t *testing.T) {
+	raw := makeTestRoster(t, "saka", 15, "grok approval")
+	raw = updateRosterApprovalMetadata(t, raw, "grok", grokRosterAuthorityRef, true)
+	manifest, chunks := makeRosterTransferBodies(t, raw, "saka", 15, 1800)
+
+	reassembled, err := reassembleRosterTransfer("saka", "saka", manifest, rosterStoredChunks(chunks))
+	if err != nil {
+		t.Fatalf("reassemble fixed grok roster: %v", err)
+	}
+	if string(reassembled) != string(raw) {
+		t.Fatalf("reassembled roster differs from source: %s", reassembled)
+	}
+}
+
+func TestRosterTransferRejectsApprovalMetadataMismatchBetweenManifestAndSource(t *testing.T) {
+	raw := makeTestRoster(t, "saka", 16, "grok approval")
+	raw = updateRosterApprovalMetadata(t, raw, "grok", grokRosterAuthorityRef, true)
+	manifest, chunks := makeRosterTransferBodies(t, raw, "saka", 16, 1800)
+
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(manifest), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	envelope["approved_by"] = "user"
+	delete(envelope, "authority_ref")
+	manifestBytes, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseRosterPiece(string(manifestBytes)); err != nil {
+		t.Fatalf("legacy user manifest should be independently valid: %v", err)
+	}
+	if _, err := reassembleRosterTransfer("saka", "saka", string(manifestBytes), rosterStoredChunks(chunks)); err == nil {
+		t.Fatal("accepted manifest approval metadata that differs from source roster")
 	}
 }
 
