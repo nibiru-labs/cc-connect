@@ -62,6 +62,7 @@ type Platform struct {
 	inflight map[string]bool
 	done     map[string]time.Time
 	replies  map[string]int // successful Reply/Send count per first message id
+	empty    *emptyBreaker  // nibiru#1346 empty-reply loop guard
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 }
@@ -120,6 +121,7 @@ func newPlatform(c Client, a Acker, opts map[string]any) *Platform {
 	return &Platform{
 		client: c, acker: a, allow: allow, interval: interval, maxChunk: maxChunk,
 		inflight: map[string]bool{}, done: map[string]time.Time{}, replies: map[string]int{},
+		empty: newEmptyBreaker(emptyLimitOpt(opts["empty_reply_limit"])),
 	}
 }
 
@@ -234,7 +236,23 @@ func (p *Platform) dispatch(ctx context.Context, handler core.MessageHandler, m 
 		return
 	}
 
+	if p.empty.shouldDrop(m.ConversationID, m.Text) {
+		// nibiru#1346: the conversation is stuck exchanging empty replies;
+		// settle the message without waking the model.
+		slog.Warn("a2a: empty-reply breaker open, acking without reply",
+			"conversation", m.ConversationID, "message_id", m.MessageID, "sender", m.SenderID,
+			"consecutive_empty", p.empty.count(m.ConversationID))
+		if err := p.client.Ack(ctx, m.MessageID); err != nil {
+			slog.Warn("a2a: ack empty message failed", "message_id", m.MessageID, "error", err)
+			p.release(m.MessageID, false)
+			return
+		}
+		p.release(m.MessageID, true)
+		return
+	}
+
 	key := "a2a:" + m.ConversationID
+	p.empty.begin(m.MessageID, m.Text)
 	p.acker.Track(key, []string{m.MessageID})
 	handler(p, &core.Message{
 		SessionKey: key,
@@ -270,6 +288,27 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 	return p.send(ctx, replyCtx, content)
 }
 
+// SendWithStatusFooter implements core.StatusFooterSender. Check the raw body
+// before composing the inline footer: status metadata alone must never turn an
+// empty A2A reply into a message that wakes a peer.
+func (p *Platform) SendWithStatusFooter(ctx context.Context, replyCtx any, content, footer string) error {
+	if isEmptyReply(content) {
+		return p.send(ctx, replyCtx, content)
+	}
+	return p.send(ctx, replyCtx, appendInlineStatusFooter(content, footer))
+}
+
+func appendInlineStatusFooter(content, footer string) string {
+	if footer == "" {
+		return content
+	}
+	content = strings.TrimRight(content, "\n")
+	if content == "" {
+		return "*" + footer + "*"
+	}
+	return content + "\n\n*" + footer + "*"
+}
+
 func (p *Platform) send(ctx context.Context, replyCtx any, content string) error {
 	rc, ok := replyCtx.(*replyContext)
 	if !ok || rc == nil || len(rc.MessageIDs) == 0 {
@@ -277,6 +316,13 @@ func (p *Platform) send(ctx context.Context, replyCtx any, content string) error
 	}
 	first := rc.MessageIDs[0]
 	replyTo := rc.MessageIDs[len(rc.MessageIDs)-1]
+
+	if isEmptyReply(content) {
+		// nibiru#1346: never put an empty / placeholder / NO_REPLY reply on
+		// the bus; a peer would answer it and the two would loop.
+		slog.Info("a2a: suppressed empty reply", "conversation", rc.ConversationID, "reply_to", replyTo)
+		return nil
+	}
 
 	p.mu.Lock()
 	n := p.replies[first]
@@ -295,6 +341,7 @@ func (p *Platform) send(ctx context.Context, replyCtx any, content string) error
 	p.mu.Lock()
 	p.replies[first]++
 	p.mu.Unlock()
+	p.empty.delivered(first)
 	return nil
 }
 
@@ -307,12 +354,36 @@ func (p *Platform) FinishTurn(_ context.Context, replyCtx any, ok bool) {
 		return
 	}
 	sessionKey := "a2a:" + rc.ConversationID
+	if n := p.empty.finish(rc.ConversationID, rc.MessageIDs[0]); n >= p.empty.limit {
+		slog.Warn("a2a: conversation hit empty-reply limit; further empty messages will be acked without reply",
+			"conversation", rc.ConversationID, "consecutive_empty", n)
+	}
 	if ok {
 		p.acker.TurnSucceededIDs(rc.MessageIDs)
 	} else {
 		p.acker.TurnFailedIDs(sessionKey, rc.MessageIDs, fmt.Errorf("a2a: turn did not complete"))
 	}
 	p.finish(rc, ok)
+}
+
+// SuppressSystemResponse implements core.SystemResponseSuppressor. A2A peers
+// must not receive an engine-generated rate-limit notice as a new conversation
+// prompt; the original inbound message is acknowledged without counting as an
+// empty assistant exchange.
+func (p *Platform) SuppressSystemResponse(_ context.Context, replyCtx any, kind core.SystemResponseKind) bool {
+	if kind != core.SystemResponseRateLimited {
+		return false
+	}
+	rc, ok := replyCtx.(*replyContext)
+	if !ok || rc == nil || len(rc.MessageIDs) == 0 {
+		return false
+	}
+	p.empty.discard(rc.MessageIDs[0])
+	p.acker.TurnSucceededIDs(rc.MessageIDs)
+	p.finish(rc, true)
+	slog.Info("a2a: suppressed system response and settled inbound turn",
+		"kind", "rate_limited", "conversation", rc.ConversationID, "message_ids", rc.MessageIDs)
+	return true
 }
 
 func (p *Platform) finish(rc *replyContext, ok bool) {
@@ -364,4 +435,21 @@ func cut(s string, max int) []string {
 		parts = append(parts, s)
 	}
 	return parts
+}
+
+// emptyLimitOpt parses the optional empty_reply_limit option (0 = default).
+func emptyLimitOpt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case string:
+		if i, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
+			return i
+		}
+	}
+	return 0
 }
