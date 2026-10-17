@@ -4972,12 +4972,13 @@ func (e *Engine) startUnsolicitedReader(state *interactiveState, session *Sessio
 	state.unsolicitedTurnActive = false
 	state.mu.Unlock()
 
-	go e.runUnsolicitedReader(ctx, cancel, done, state, readerGeneration, agentSession, session, sessions, sessionKey, workspaceDir)
+	go e.runUnsolicitedReader(ctx, cancel, done, state, readerGeneration, agentSession, session, sessions, sessionKey, workspaceDir, nil)
 }
 
 // runUnsolicitedReader is the goroutine body for the unsolicited event reader.
 // agentSession is captured by the caller so we don't race with
-// cleanupInteractiveState nilling state.agentSession.
+// cleanupInteractiveState nilling state.agentSession. beforeBeginTurn is an
+// optional synchronization seam for ownership-handoff tests.
 func (e *Engine) beginUnsolicitedTurn(state *interactiveState, readerGeneration uint64) bool {
 	state.mu.Lock()
 	if state.unsolicitedReaderGeneration != readerGeneration || state.stopped || state.agentSession == nil {
@@ -5014,7 +5015,7 @@ func (e *Engine) completeUnsolicitedTurn(state *interactiveState, readerGenerati
 	return true
 }
 
-func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.CancelFunc, done chan struct{}, state *interactiveState, readerGeneration uint64, agentSession AgentSession, session *Session, sessions *SessionManager, sessionKey string, workspaceDir string) {
+func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.CancelFunc, done chan struct{}, state *interactiveState, readerGeneration uint64, agentSession AgentSession, session *Session, sessions *SessionManager, sessionKey string, workspaceDir string, beforeBeginTurn func()) {
 	defer close(done)
 	defer cancel()
 	defer e.finishUnsolicitedTurn(state, readerGeneration)
@@ -5077,11 +5078,20 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				return
 			default:
 			}
+			if beforeBeginTurn != nil {
+				beforeBeginTurn()
+			}
 
 			// Claim this event only if this reader is still current. The shared
 			// active marker cancels an existing idle timer and prevents a later
 			// schedule call from arming one while the turn is running.
 			if !e.beginUnsolicitedTurn(state, readerGeneration) {
+				// This reader already removed an event from Events(), but lost
+				// ownership before it could process it. Force the foreground
+				// handoff to drain any remaining events from that old turn.
+				state.mu.Lock()
+				state.eventsNeedResync = true
+				state.mu.Unlock()
 				return
 			}
 

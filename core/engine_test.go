@@ -14686,6 +14686,116 @@ func TestUnsolicitedReader_StaleReaderCannotChangeCurrentTurnMarker(t *testing.T
 	}
 }
 
+func TestUnsolicitedReaderStopAfterReadBeforeClaimResyncsForeground(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	agent := &stubAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+
+	const sessionKey = "test:unsolicited-stop-claim:u1"
+	agentSession := newBlockingSendSession("unsol-stop-claim")
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	session.SetAgentSessionID(agentSession.sessionID, agent.Name())
+	state := &interactiveState{
+		agentSession:     agentSession,
+		platform:         p,
+		replyCtx:         "ctx",
+		eventsNeedResync: false,
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[sessionKey] = state
+	e.interactiveMu.Unlock()
+
+	ctx, cancel := context.WithCancel(e.ctx)
+	done := make(chan struct{})
+	state.mu.Lock()
+	state.unsolicitedCancel = cancel
+	state.unsolicitedDone = done
+	state.unsolicitedReaderGeneration = 1
+	state.mu.Unlock()
+
+	beforeBegin := make(chan struct{})
+	releaseBegin := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseClaim := func() { releaseOnce.Do(func() { close(releaseBegin) }) }
+	var unblockOnce sync.Once
+	unblockSend := func() { unblockOnce.Do(func() { close(agentSession.unblock) }) }
+	defer func() {
+		releaseClaim()
+		unblockSend()
+		e.stopUnsolicitedReader(state)
+	}()
+
+	// The reader consumes the first event and pauses after the cancellation
+	// check, leaving the old turn's terminal event buffered for foreground.
+	agentSession.events <- Event{Type: EventText, Content: "stale turn prefix"}
+	agentSession.events <- Event{Type: EventResult, Content: "stale background result", Done: true}
+	go e.runUnsolicitedReader(ctx, cancel, done, state, 1, agentSession, session, e.sessions, sessionKey, "", func() {
+		close(beforeBegin)
+		<-releaseBegin
+	})
+	select {
+	case <-beforeBegin:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not reach the post-cancellation-check claim barrier")
+	}
+
+	lockGen, locked := session.TryLock()
+	if !locked {
+		t.Fatal("could not lock session for the foreground turn")
+	}
+	turnDone := make(chan struct{})
+	go func() {
+		e.processInteractiveMessageWith(p, &Message{
+			Platform:   "test",
+			SessionKey: sessionKey,
+			UserID:     "u1",
+			Content:    "new foreground prompt",
+			ReplyCtx:   "ctx",
+		}, session, agent, e.sessions, sessionKey, "", "", lockGen)
+		close(turnDone)
+	}()
+
+	// stopUnsolicitedReader cancels only after invalidating this reader's
+	// generation. Since the reader is held at the barrier, cancellation here
+	// proves the foreground stop reached that point before begin is released.
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("foreground did not cancel the unsolicited reader")
+	}
+	releaseClaim()
+	select {
+	case <-agentSession.sendStarted:
+		// Send starts only after the normal stop path has waited for done and
+		// the foreground resync check/drain has run.
+	case <-time.After(time.Second):
+		t.Fatal("foreground did not reach agent Send after reader shutdown")
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("foreground advanced without the unsolicited reader exiting")
+	}
+	unblockSend()
+	agentSession.events <- Event{Type: EventResult, Content: "fresh foreground result", Done: true}
+
+	select {
+	case <-turnDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("foreground turn did not complete")
+	}
+	e.stopUnsolicitedReader(state)
+
+	sent := strings.Join(p.getSent(), "\n")
+	if strings.Contains(sent, "stale background result") {
+		t.Fatalf("stale unsolicited result leaked into foreground output: %q", sent)
+	}
+	if !strings.Contains(sent, "fresh foreground result") {
+		t.Fatalf("foreground response was not delivered: %q", sent)
+	}
+}
+
 // TestUnsolicitedReader_StopsOnCancel verifies that stopUnsolicitedReader
 // cleanly stops the reader goroutine and waits for it to exit.
 func TestUnsolicitedReader_StopsOnCancel(t *testing.T) {
