@@ -132,9 +132,9 @@ nibiru/deploy/switch-to-a2a.sh
 | 现象 | 当前状态 | 处理 |
 |---|---|---|
 | `refusing: ... still loaded` 或 `aborted: old consumer still running` | runner 仍在跑，cc-connect 未动 | 正常，有单一消费者。查明 runner 为何卸不掉，再重试。不要手动 kill。 |
-| `aborted: cc-connect still loaded; runner stays stopped` | **没有消费者**（runner 已停，cc-connect 未重载） | 立即执行 2.4 回滚，把 runner 拉回来。 |
-| bootstrap cc-connect 失败，或末行不是 `switched.` | **没有消费者**（runner 已停） | 立即执行 2.4 回滚。 |
-| 脚本成功，但 cc-connect 启动后崩溃循环 | 无 runner，cc-connect 异常 | 执行 2.4 回滚。 |
+| `aborted: cc-connect still loaded; runner stays stopped` | **没有消费者**（runner 已停，cc-connect 未重载） | 立即执行 2.6 回滚，把 runner 拉回来。 |
+| bootstrap cc-connect 失败，或末行不是 `switched.` | **没有消费者**（runner 已停） | 立即执行 2.6 回滚。 |
+| 脚本成功，但 cc-connect 启动后崩溃循环 | 无 runner，cc-connect 异常 | 执行 2.6 回滚。 |
 
 **没有消费者的窗口**：runner 已停而 cc-connect 未就绪时，A2A 消息会堆在收件箱里，不会丢失（未 ack 的消息会再次出现）。窗口内必须尽快完成回滚或修复，不要长时间停留。
 
@@ -145,11 +145,11 @@ nibiru/deploy/switch-to-a2a.sh
 | # | 检查 | 命令 / 动作 | 预期 | 失败判据 |
 |---|---|---|---|---|
 | V1 | cc-connect 在跑 | `launchctl print gui/$(id -u)/com.cc-connect.service \| grep -E 'state\|pid'` | `running` | 非 running，或 pid 持续变化 |
-| V2 | runner 已卸载 | `launchctl print gui/$(id -u)/com.nibiru.sakura-runner` | 非零退出（服务未加载） | 仍能打印出 state，说明两个消费者可能同时存在 → 立即 2.4 回滚 |
+| V2 | runner 已卸载 | `launchctl print gui/$(id -u)/com.nibiru.sakura-runner` | 非零退出（服务未加载） | 仍能打印出 state，说明两个消费者可能同时存在 → 立即 2.6 回滚 |
 | V3 | a2a 平台启动 | `tail -n 200 ~/.cc-connect/logs/cc-connect.log` | 有 a2a 平台启动的日志，无 `panic` / `fatal` | 无启动日志，或出现 panic |
-| V4 | 无重复回复 | 观察日志 10 分钟 | 没有同一 `message_id` 被回复两次 | 出现重复回复（两个消费者的迹象）→ 立即 2.4 回滚 |
-| V5 | 功能冒烟 | 由名册内成员（`allow_from` 默认 `grok,dot,claude-cloud,hermes`）发一条测试消息 | 收到回复；该消息不再出现在 `a2a read --pending` 中 | 无回复，且日志出现 `a2a: turn failed, message will be redelivered` 持续 3 次以上 → 2.4 回滚 |
-| V6 | 非名册被丢弃 | 由名册外的发件人发一条消息（可选） | 日志记录后丢弃，不进模型 | 进入了模型（有回复）→ 立即 2.4 回滚 |
+| V4 | 无重复回复 | 观察日志 10 分钟 | 没有同一 `message_id` 被回复两次 | 出现重复回复（两个消费者的迹象）→ 立即 2.6 回滚 |
+| V5 | 功能冒烟 | 由名册内成员（`allow_from` 默认 `grok,dot,claude-cloud,hermes`）发一条测试消息并记录 `message_id`；收到回复后由发件人运行只读命令 `a2a get <message_id>` | 收到回复；查询回执显示 `state=acked` | 无回复或查询状态不是 `acked`；且日志出现 `a2a: turn failed, message will be redelivered` 持续 3 次以上 → 2.6 回滚 |
+| V6 | 非名册被丢弃 | 由名册外的发件人发一条消息（可选） | 日志记录后丢弃，不进模型 | 进入了模型（有回复）→ 立即 2.6 回滚 |
 | V7 | 回复失败不 ack | 人为制造一次回复失败（可选，测试机做更安全） | 日志出现 `a2a: ack failed, will retry` 或 `turn failed`，消息再次出现 | 消息被 ack 但未回复 |
 | V8 | 钉钉通道正常 | 在钉钉项目发一条普通消息 | 正常回复 | 钉钉通道异常，且与 a2a 无关 → 记录，不一定回滚（由操作者判断） |
 
