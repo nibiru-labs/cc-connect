@@ -15,7 +15,13 @@ RUNTIME_FILES = {
     "core/runtime_snapshot_test.go",
     "docs/runtime-snapshot.md",
 }
-ALLOWED = RUNTIME_FILES | {
+INTEGRATED_SOURCE_COMMIT = "9540a1b087dc19b423606ecaae11052d0ca8a197"
+INTEGRATED_SOURCE_BLOBS = {
+    # Pin the two already-reviewed idle/unsolicited-turn integration paths.
+    "core/engine.go": "ed5cbe102203a0bf49735e86b2cc0157b82ddb3a",
+    "core/engine_test.go": "71de554a5860c3df1a7146c27acf7fb59227e764",
+}
+ALLOWED = RUNTIME_FILES | set(INTEGRATED_SOURCE_BLOBS) | {
     "spec/1256-installed-backport.md",
     "docs/runtime-backport-release.md",
     "tools/runtime_snapshot_source_guard.py",
@@ -35,6 +41,15 @@ def main():
     for path in sorted(RUNTIME_FILES):
         if git("show", "HEAD:" + path) != git("show", RUNTIME_SOURCE + ":" + path):
             raise SystemExit("Runtime patch differs from reviewed source: " + path)
+    for path, expected_blob in sorted(INTEGRATED_SOURCE_BLOBS.items()):
+        actual_blob = git("rev-parse", "HEAD:" + path).decode().strip()
+        if actual_blob != expected_blob:
+            raise SystemExit(
+                "Integrated source differs from reviewed source "
+                + INTEGRATED_SOURCE_COMMIT
+                + ": "
+                + path
+            )
     if git("status", "--porcelain", "--untracked-files=normal").strip():
         raise SystemExit("Build source must be clean (including untracked files)")
     # This checks every tracked baseline file outside the explicit allowlist,
