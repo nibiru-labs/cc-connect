@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -65,6 +66,22 @@ func TestRosterFilterDropsAndAcks(t *testing.T) {
 	})
 	if got := r.all()[0].UserID; got != "dot" {
 		t.Fatalf("delivered %q", got)
+	}
+}
+
+// Regression: the pre-receiver path forwarded each bounded roster piece to the
+// model as an independent A2A message. An incomplete group must stay in the
+// platform layer and produce no model input.
+func TestRosterTransferIncompletePartsDoNotReachModel(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	manifest := fmt.Sprintf(`{"type":"xstation.roster.manifest.v1","version":2,"issued_by":"saka","approved_by":"user","payload_format":"source-roster-json-utf8","source_sha256":%q,"payload_sha256":%q,"payload_bytes":32,"chunks":2}`, digest, digest)
+	chunk := fmt.Sprintf(`{"type":"xstation.roster.chunk.v1","version":2,"issued_by":"saka","source_sha256":%q,"payload_sha256":%q,"index":0,"total":2,"text":"{"}`, digest, digest)
+	p, _ := newRosterReceiverPlatform(t, filepath.Join(t.TempDir(), "roster-state.json"), time.Now)
+	r := &recorder{}
+	p.dispatch(context.Background(), r.handle, in("manifest-1", "c1", "saka", manifest))
+	p.dispatch(context.Background(), r.handle, in("chunk-1", "c1", "saka", chunk))
+	if got := len(r.all()); got != 0 {
+		t.Fatalf("incomplete roster parts reached model: got %d messages, want 0", got)
 	}
 }
 

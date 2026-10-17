@@ -25,6 +25,9 @@ type = "a2a"
 [projects.platforms.options]
 # Roster: messages from anyone else are logged, acked and dropped (never reach the model).
 allow_from = "grok,dot,claude-cloud,hermes"
+# Bounded roster receiving is disabled unless this issuer is explicitly set.
+# It must already be present in allow_from; configure both locally when enabling.
+# roster_issuer = "<trusted-issuer-id>"
 # Option names match platform/a2a/a2a.go (nibiru-labs/cc-connect#7); all optional.
 # a2a_bin = "/Users/surlymo/bin/a2a"  # A2A CLI, absolute path (no ~ expansion; default $HOME/bin/a2a)
 # poll_interval = "5s"        # inbox polling interval (default 5s)
