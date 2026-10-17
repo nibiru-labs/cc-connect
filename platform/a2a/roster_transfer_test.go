@@ -232,6 +232,56 @@ func TestRosterApprovalMetadataAllowsLegacyAndFixedGrokOnly(t *testing.T) {
 	}
 }
 
+func TestRosterTransferDutyFallbackMatchesPythonFixture(t *testing.T) {
+	fixtureBytes, err := os.ReadFile("testdata/roster_duty_fallback.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := decodeUniqueJSON(fixtureBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture, ok := value.(map[string]any)
+	if !ok {
+		t.Fatal("fixture must be an object")
+	}
+	cases, ok := fixture["cases"].([]any)
+	if !ok || len(cases) == 0 {
+		t.Fatal("fixture cases must be a non-empty array")
+	}
+	for _, value := range cases {
+		caseValue, ok := value.(map[string]any)
+		if !ok {
+			t.Fatal("fixture case must be an object")
+		}
+		name, _ := caseValue["name"].(string)
+		t.Run(name, func(t *testing.T) {
+			roster, ok := caseValue["roster"].(map[string]any)
+			if !ok {
+				t.Fatal("case roster must be an object")
+			}
+			expectedIssuer, _ := caseValue["expected_issuer"].(string)
+			wantValid, ok := caseValue["python_valid"].(bool)
+			if expectedIssuer == "" || !ok {
+				t.Fatal("case must include expected_issuer and python_valid")
+			}
+			raw, err := json.Marshal(roster)
+			if err != nil {
+				t.Fatal(err)
+			}
+			version, err := positiveJSONInteger(roster["version"], "version")
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest, chunks := makeRosterTransferBodies(t, raw, expectedIssuer, version, 1800)
+			_, err = reassembleRosterTransfer(expectedIssuer, expectedIssuer, manifest, rosterStoredChunks(chunks))
+			if (err == nil) != wantValid {
+				t.Fatalf("reassembleRosterTransfer error = %v, want valid=%t", err, wantValid)
+			}
+		})
+	}
+}
+
 func TestRosterTransferReassemblesFixedGrokApprovalMetadata(t *testing.T) {
 	raw := makeTestRoster(t, "saka", 15, "grok approval")
 	raw = updateRosterApprovalMetadata(t, raw, "grok", grokRosterAuthorityRef, true)

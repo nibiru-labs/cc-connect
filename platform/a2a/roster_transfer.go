@@ -793,7 +793,8 @@ func validateRoster(roster map[string]any, expectedIssuer string) error {
 	if _, err := positiveJSONInteger(roster["version"], "version"); err != nil {
 		return err
 	}
-	if issuer, ok := roster["issued_by"].(string); !ok || issuer == "" || issuer != expectedIssuer {
+	issuer, ok := roster["issued_by"].(string)
+	if !ok || issuer == "" || issuer != expectedIssuer {
 		return errors.New("issued_by must match trusted expected_issuer")
 	}
 	members, ok := roster["members"].([]any)
@@ -803,6 +804,10 @@ func validateRoster(roster map[string]any, expectedIssuer string) error {
 	memberIDs, memberFullNames, err := validateRosterMembers(members)
 	if err != nil {
 		return err
+	}
+	currentMemberIDs := make(map[string]bool, len(memberIDs))
+	for id := range memberIDs {
+		currentMemberIDs[id] = true
 	}
 	if raw, exists := roster["charter"]; exists {
 		if err := validateRosterCharter(raw); err != nil {
@@ -814,7 +819,59 @@ func validateRoster(roster map[string]any, expectedIssuer string) error {
 			return err
 		}
 	}
+	if err := validateRosterDutyFallback(issuer, members, currentMemberIDs); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateRosterDutyFallback mirrors the upstream issuer fallback: current
+// member issuers return before duty fields are inspected; only a non-member
+// issuer consults the unique-coordinator fallback.
+func validateRosterDutyFallback(issuer string, members []any, memberIDs map[string]bool) error {
+	if memberIDs[issuer] {
+		return nil
+	}
+
+	coordinators := 0
+	for _, value := range members {
+		member := value.(map[string]any) // validateRosterMembers has checked this shape.
+		hasCoordinator, err := rosterMemberHasCoordinatorDuty(member["duty"])
+		if err != nil {
+			return err
+		}
+		if hasCoordinator {
+			coordinators++
+			if coordinators > 1 {
+				return errors.New("roster has more than one member with duty=coordinator")
+			}
+		}
+	}
+	return nil
+}
+
+func rosterMemberHasCoordinatorDuty(raw any) (bool, error) {
+	if raw == nil {
+		return false, nil
+	}
+	switch duty := raw.(type) {
+	case string:
+		return duty == "coordinator", nil
+	case []any:
+		hasCoordinator := false
+		for _, value := range duty {
+			text, ok := value.(string)
+			if !ok || text == "" {
+				return false, errors.New("member duty must be a string or an array of non-empty strings")
+			}
+			if text == "coordinator" {
+				hasCoordinator = true
+			}
+		}
+		return hasCoordinator, nil
+	default:
+		return false, errors.New("member duty must be a string or an array of non-empty strings")
+	}
 }
 
 func validateRosterMembers(members []any) (map[string]bool, map[string]bool, error) {
