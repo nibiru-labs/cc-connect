@@ -232,6 +232,82 @@ func TestRosterApprovalMetadataAllowsLegacyAndFixedGrokOnly(t *testing.T) {
 	}
 }
 
+func TestRosterTransferDutyFallbackOnlyWhenIssuerIsNotMember(t *testing.T) {
+	tests := []struct {
+		name      string
+		issuer    string
+		duties    map[int]any
+		retired   bool
+		wantError bool
+	}{
+		{
+			name:      "non-member issuer rejects duplicate coordinators",
+			issuer:    "trusted-sender",
+			duties:    map[int]any{0: "coordinator", 1: "coordinator"},
+			wantError: true,
+		},
+		{
+			name:      "non-member issuer rejects malformed duty",
+			issuer:    "trusted-sender",
+			duties:    map[int]any{1: float64(42)},
+			wantError: true,
+		},
+		{
+			name:      "member issuer bypasses duplicate coordinator fallback",
+			issuer:    "saka",
+			duties:    map[int]any{0: "coordinator", 1: "coordinator"},
+			wantError: false,
+		},
+		{
+			name:      "member issuer bypasses malformed duty fallback",
+			issuer:    "saka",
+			duties:    map[int]any{1: float64(42)},
+			wantError: false,
+		},
+		{
+			name:      "non-member issuer without coordinator remains valid",
+			issuer:    "trusted-sender",
+			wantError: false,
+		},
+		{
+			name:      "retired issuer still uses coordinator fallback",
+			issuer:    "trusted-sender",
+			duties:    map[int]any{0: "coordinator", 1: "coordinator"},
+			retired:   true,
+			wantError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := makeTestRoster(t, tc.issuer, 19, "duty fallback")
+			var roster map[string]any
+			if err := json.Unmarshal(raw, &roster); err != nil {
+				t.Fatal(err)
+			}
+			members := roster["members"].([]any)
+			for index, duty := range tc.duties {
+				members[index].(map[string]any)["duty"] = duty
+			}
+			if tc.retired {
+				roster["retired"] = []any{map[string]any{
+					"id": "trusted-sender", "name": "trusted", "full_name": "trusted-retired-agent",
+					"retired_at": "2025-01-01", "reason": "retired", "decision": "retired from roster",
+				}}
+			}
+			raw, err := json.Marshal(roster)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest, chunks := makeRosterTransferBodies(t, raw, tc.issuer, 19, 1800)
+			_, err = reassembleRosterTransfer(tc.issuer, tc.issuer, manifest, rosterStoredChunks(chunks))
+			if (err != nil) != tc.wantError {
+				t.Fatalf("reassembleRosterTransfer error = %v, wantError=%t", err, tc.wantError)
+			}
+		})
+	}
+}
+
 func TestRosterTransferReassemblesFixedGrokApprovalMetadata(t *testing.T) {
 	raw := makeTestRoster(t, "saka", 15, "grok approval")
 	raw = updateRosterApprovalMetadata(t, raw, "grok", grokRosterAuthorityRef, true)
