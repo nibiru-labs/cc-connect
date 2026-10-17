@@ -410,7 +410,7 @@ func TestRuntimeEndpointConcurrentRelaySnapshotsDoNotLeak(t *testing.T) {
 	const readers = 8
 	const samples = 20
 	start := make(chan struct{})
-	errs := make(chan error, readers*samples)
+	errs := make(chan error, readers*samples*5)
 	var wg sync.WaitGroup
 	for i := 0; i < readers; i++ {
 		wg.Add(1)
