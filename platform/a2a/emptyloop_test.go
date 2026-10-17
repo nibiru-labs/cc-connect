@@ -14,9 +14,21 @@ func TestIsEmptyReply(t *testing.T) {
 			t.Errorf("isEmptyReply(%q)=false, want true", s)
 		}
 	}
-	for _, s := range []string{"ok", "(空响应) 但有内容", "NO_REPLY please", "收到"} {
+	for _, s := range []string{"ok", "(空响应) 但有内容", "NO_REPLY please", "收到",
+		"说明：(空响应)\n\n*gpt-6-luna · ctx 9%*", "(空响应)\n\n这是正文，不是 core footer"} {
 		if isEmptyReply(s) {
 			t.Errorf("isEmptyReply(%q)=true, want false", s)
+		}
+	}
+}
+
+func TestFooterDecoratedPlaceholderIsAmbiguousWithoutMetadata(t *testing.T) {
+	for _, s := range []string{
+		"(空响应)\n\n*gpt-6-luna · ctx 9%*",
+		"(空响应)\n\n*这是一条普通正文*",
+	} {
+		if isEmptyReply(s) {
+			t.Errorf("isEmptyReply(%q)=true without trusted footer metadata", s)
 		}
 	}
 }

@@ -34,8 +34,11 @@ var emptyPlaceholders = map[string]bool{
 
 var noReplyRe = regexp.MustCompile(`(?i)^\s*NO_REPLY\s*$`)
 
-// isEmptyReply reports whether text carries no content worth delivering or
-// answering: blank, a bare NO_REPLY marker, or the engine's empty placeholder.
+// isEmptyReply reports whether raw text carries no content worth delivering or
+// answering: blank, a bare NO_REPLY marker, or the engine's exact placeholder.
+// Footer-decorated legacy text is intentionally ambiguous on inbound A2A: the
+// transport provides no trusted body/footer metadata to distinguish it from
+// substantive text, so the footer-aware send path must prevent new instances.
 func isEmptyReply(text string) bool {
 	t := strings.TrimSpace(text)
 	if t == "" || noReplyRe.MatchString(t) {
@@ -81,6 +84,15 @@ func (b *emptyBreaker) shouldDrop(conv, text string) bool {
 func (b *emptyBreaker) begin(firstID, text string) {
 	b.mu.Lock()
 	b.inboundEmpty[firstID] = isEmptyReply(text)
+	b.mu.Unlock()
+}
+
+// discard removes a turn that was settled by a platform control policy rather
+// than by an assistant response. It must not change the empty-exchange count.
+func (b *emptyBreaker) discard(firstID string) {
+	b.mu.Lock()
+	delete(b.inboundEmpty, firstID)
+	delete(b.realSent, firstID)
 	b.mu.Unlock()
 }
 

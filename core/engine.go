@@ -3118,6 +3118,10 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	if !e.checkRateLimit(msg) {
 		slog.Info("message rate limited",
 			"session", msg.SessionKey, "user_id", msg.UserID, "user", msg.UserName)
+		if suppressor, ok := p.(SystemResponseSuppressor); ok &&
+			suppressor.SuppressSystemResponse(e.ctx, msg.ReplyCtx, SystemResponseRateLimited) {
+			return
+		}
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgRateLimited))
 		return
 	}

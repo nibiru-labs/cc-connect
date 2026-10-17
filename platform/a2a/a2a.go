@@ -288,6 +288,27 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 	return p.send(ctx, replyCtx, content)
 }
 
+// SendWithStatusFooter implements core.StatusFooterSender. Check the raw body
+// before composing the inline footer: status metadata alone must never turn an
+// empty A2A reply into a message that wakes a peer.
+func (p *Platform) SendWithStatusFooter(ctx context.Context, replyCtx any, content, footer string) error {
+	if isEmptyReply(content) {
+		return p.send(ctx, replyCtx, content)
+	}
+	return p.send(ctx, replyCtx, appendInlineStatusFooter(content, footer))
+}
+
+func appendInlineStatusFooter(content, footer string) string {
+	if footer == "" {
+		return content
+	}
+	content = strings.TrimRight(content, "\n")
+	if content == "" {
+		return "*" + footer + "*"
+	}
+	return content + "\n\n*" + footer + "*"
+}
+
 func (p *Platform) send(ctx context.Context, replyCtx any, content string) error {
 	rc, ok := replyCtx.(*replyContext)
 	if !ok || rc == nil || len(rc.MessageIDs) == 0 {
@@ -343,6 +364,26 @@ func (p *Platform) FinishTurn(_ context.Context, replyCtx any, ok bool) {
 		p.acker.TurnFailedIDs(sessionKey, rc.MessageIDs, fmt.Errorf("a2a: turn did not complete"))
 	}
 	p.finish(rc, ok)
+}
+
+// SuppressSystemResponse implements core.SystemResponseSuppressor. A2A peers
+// must not receive an engine-generated rate-limit notice as a new conversation
+// prompt; the original inbound message is acknowledged without counting as an
+// empty assistant exchange.
+func (p *Platform) SuppressSystemResponse(_ context.Context, replyCtx any, kind core.SystemResponseKind) bool {
+	if kind != core.SystemResponseRateLimited {
+		return false
+	}
+	rc, ok := replyCtx.(*replyContext)
+	if !ok || rc == nil || len(rc.MessageIDs) == 0 {
+		return false
+	}
+	p.empty.discard(rc.MessageIDs[0])
+	p.acker.TurnSucceededIDs(rc.MessageIDs)
+	p.finish(rc, true)
+	slog.Info("a2a: suppressed system response and settled inbound turn",
+		"kind", "rate_limited", "conversation", rc.ConversationID, "message_ids", rc.MessageIDs)
+	return true
 }
 
 func (p *Platform) finish(rc *replyContext, ok bool) {

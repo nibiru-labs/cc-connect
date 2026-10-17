@@ -3134,6 +3134,28 @@ func TestEngine_RateLimit_GlobalFallback(t *testing.T) {
 	}
 }
 
+func TestEngine_RateLimit_NonSuppressingPlatformStillReplies(t *testing.T) {
+	p := &stubPlatformEngine{n: "slack"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetRateLimitCfg(RateLimitCfg{MaxMessages: 1, Window: time.Minute})
+	defer e.Stop()
+
+	first := &Message{SessionKey: "slack:C1:U1", Platform: "slack", UserID: "U1", Content: "first"}
+	if !e.checkRateLimit(first) {
+		t.Fatal("first message unexpectedly rate-limited")
+	}
+	// A normal user may send the same text as the engine's rate-limit response;
+	// the policy applies to response type, not to matching message content.
+	want := e.i18n.T(MsgRateLimited)
+	second := &Message{SessionKey: first.SessionKey, Platform: "slack", UserID: "U1",
+		Content: want, ReplyCtx: "ctx"}
+	e.ReceiveMessage(p, second)
+	got := p.getSent()
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("non-suppressing platform sent=%q, want the ordinary rate-limit response %q", got, want)
+	}
+}
+
 // --- permission prompt card tests ---
 
 func TestSendPermissionPrompt_CardPlatform(t *testing.T) {
