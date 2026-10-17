@@ -21,23 +21,37 @@ import (
 
 // CronJob represents a persisted scheduled task.
 type CronJob struct {
-	ID          string    `json:"id"`
-	Project     string    `json:"project"`
-	SessionKey  string    `json:"session_key"`
-	CronExpr    string    `json:"cron_expr"`
-	Prompt      string    `json:"prompt"`
-	Exec        string    `json:"exec,omitempty"`     // shell command; mutually exclusive with Prompt
-	WorkDir     string    `json:"work_dir,omitempty"` // working directory for exec; empty = agent work_dir
-	Description string    `json:"description"`
-	Enabled     bool      `json:"enabled"`
-	Silent      *bool     `json:"silent,omitempty"`       // suppress start notification; nil = use global default
-	Mute        bool      `json:"mute,omitempty"`         // suppress ALL messages (start + result); job runs silently
-	SessionMode string    `json:"session_mode,omitempty"` // "" or "reuse" = share active session; "new_per_run" = fresh session each run
-	Mode        string    `json:"mode,omitempty"`         // permission mode override for this job; "" = use project default
-	TimeoutMins *int      `json:"timeout_mins,omitempty"` // nil = default 30m wait; 0 = no limit; >0 = minutes
-	CreatedAt   time.Time `json:"created_at"`
-	LastRun     time.Time `json:"last_run,omitempty"`
-	LastError   string    `json:"last_error,omitempty"`
+	ID              string    `json:"id"`
+	Project         string    `json:"project"`
+	SessionKey      string    `json:"session_key"`
+	RouteSessionKey string    `json:"route_session_key,omitempty"` // platform delivery route when SessionKey is a shared identity
+	CronExpr        string    `json:"cron_expr"`
+	Prompt          string    `json:"prompt"`
+	Exec            string    `json:"exec,omitempty"`     // shell command; mutually exclusive with Prompt
+	WorkDir         string    `json:"work_dir,omitempty"` // working directory for exec; empty = agent work_dir
+	Description     string    `json:"description"`
+	Enabled         bool      `json:"enabled"`
+	Silent          *bool     `json:"silent,omitempty"`       // suppress start notification; nil = use global default
+	Mute            bool      `json:"mute,omitempty"`         // suppress ALL messages (start + result); job runs silently
+	SessionMode     string    `json:"session_mode,omitempty"` // "" or "reuse" = share active session; "new_per_run" = fresh session each run
+	Mode            string    `json:"mode,omitempty"`         // permission mode override for this job; "" = use project default
+	TimeoutMins     *int      `json:"timeout_mins,omitempty"` // nil = default 30m wait; 0 = no limit; >0 = minutes
+	CreatedAt       time.Time `json:"created_at"`
+	LastRun         time.Time `json:"last_run,omitempty"`
+	LastError       string    `json:"last_error,omitempty"`
+}
+
+// platformSessionKey returns the key used to resolve delivery and platform
+// configuration. Older jobs leave RouteSessionKey empty and keep the original
+// same-key behavior.
+func (j *CronJob) platformSessionKey() string {
+	if j == nil {
+		return ""
+	}
+	if j.RouteSessionKey != "" {
+		return j.RouteSessionKey
+	}
+	return j.SessionKey
 }
 
 // IsShellJob returns true if the job runs a shell command directly.
@@ -87,12 +101,12 @@ func NormalizeCronSessionMode(s string) string {
 }
 
 func validateCronJob(j *CronJob) error {
-	// SessionKey anchors the cron execution to a platform (ExecuteCronJob
-	// derives platformName from the prefix before ":"). Without it the job
-	// is persisted but fails at fire-time with the unhelpful
-	// `platform "" not found for session ""`. Reject it up front so the
-	// caller (management API, /cron/add, /cron edit) sees an immediate
-	// 400 instead of a job that silently never runs.
+	// SessionKey anchors cron execution to an engine session. RouteSessionKey
+	// optionally identifies the platform delivery target; older jobs leave it
+	// empty and use SessionKey for both. Without SessionKey the job is persisted
+	// but fails at fire-time with the unhelpful `platform "" not found` error.
+	// Reject it up front so callers see an immediate error instead of a job
+	// that silently never runs.
 	if strings.TrimSpace(j.SessionKey) == "" {
 		return fmt.Errorf("session_key is required")
 	}
@@ -515,9 +529,10 @@ func (cs *CronScheduler) Start() error {
 			cs.mu.RLock()
 			eng := cs.engines[job.Project]
 			cs.mu.RUnlock()
-			if eng != nil && job.SessionKey != "" && !eng.HasPlatformForSession(job.SessionKey) {
+			platformSessionKey := job.platformSessionKey()
+			if eng != nil && platformSessionKey != "" && !eng.HasPlatformForSession(platformSessionKey) {
 				slog.Error("cron: job bound to an unconfigured platform, not scheduled — rebind or disable it",
-					"id", job.ID, "project", job.Project, "session_key", job.SessionKey)
+					"id", job.ID, "project", job.Project, "session_key", platformSessionKey)
 				continue
 			}
 			if err := cs.scheduleJob(job); err != nil {

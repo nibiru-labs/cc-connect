@@ -1514,9 +1514,11 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	})
 
 	sessionKey := job.SessionKey
+	platformSessionKey := job.platformSessionKey()
+	hasSeparateRoute := job.RouteSessionKey != ""
 	platformName := ""
-	if idx := strings.Index(sessionKey, ":"); idx > 0 {
-		platformName = sessionKey[:idx]
+	if idx := strings.Index(platformSessionKey, ":"); idx > 0 {
+		platformName = platformSessionKey[:idx]
 	}
 
 	var targetPlatform Platform
@@ -1532,16 +1534,21 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	if targetPlatform == nil {
 		for _, p := range e.platforms {
 			needle := ":" + p.Name() + ":"
-			if idx := strings.Index(sessionKey, needle); idx >= 0 {
+			if idx := strings.Index(platformSessionKey, needle); idx >= 0 {
 				targetPlatform = p
 				platformName = p.Name()
-				sessionKey = sessionKey[idx+1:] // strip workspace prefix
+				platformSessionKey = platformSessionKey[idx+1:] // strip workspace prefix
 				break
 			}
 		}
 	}
 	if targetPlatform == nil {
-		return fmt.Errorf("platform %q not found for session %q", platformName, sessionKey)
+		return fmt.Errorf("platform %q not found for session %q", platformName, platformSessionKey)
+	}
+	if !hasSeparateRoute {
+		// Preserve legacy workspace-key normalization for jobs where identity and
+		// delivery were represented by the same session key.
+		sessionKey = platformSessionKey
 	}
 
 	rc, ok := targetPlatform.(ReplyContextReconstructor)
@@ -1550,18 +1557,22 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	}
 
 	runSessionKey := sessionKey
+	replySessionKey := platformSessionKey
 	var replyCtx any
 	var err error
 	if !job.Mute {
 		if resolver, ok := targetPlatform.(CronReplyTargetResolver); ok {
-			resolvedSessionKey, resolvedReplyCtx, err := resolver.ResolveCronReplyTarget(sessionKey, cronRunTitle(job))
+			resolvedSessionKey, resolvedReplyCtx, err := resolver.ResolveCronReplyTarget(platformSessionKey, cronRunTitle(job))
 			if err != nil {
 				if !errors.Is(err, ErrNotSupported) {
 					return fmt.Errorf("resolve cron reply target: %w", err)
 				}
 			} else {
 				if resolvedSessionKey != "" {
-					runSessionKey = resolvedSessionKey
+					replySessionKey = resolvedSessionKey
+					if !hasSeparateRoute {
+						runSessionKey = resolvedSessionKey
+					}
 				}
 				if resolvedReplyCtx != nil {
 					replyCtx = resolvedReplyCtx
@@ -1570,7 +1581,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		}
 	}
 	if replyCtx == nil {
-		replyCtx, err = rc.ReconstructReplyCtx(runSessionKey)
+		replyCtx, err = rc.ReconstructReplyCtx(replySessionKey)
 		if err != nil {
 			return fmt.Errorf("reconstruct reply context: %w", err)
 		}
@@ -1626,7 +1637,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	workspaceDir := ""
 
 	if e.multiWorkspace {
-		channelID := extractChannelID(sessionKey)
+		channelID := extractChannelID(platformSessionKey)
 		if channelID != "" {
 			workspace, _, err := e.resolveWorkspace(targetPlatform, channelID)
 			if err == nil && workspace != "" {
@@ -14640,13 +14651,14 @@ func (e *Engine) cmdCronAdd(p Platform, msg *Message, args []string) {
 	prompt := strings.Join(args[5:], " ")
 
 	job := &CronJob{
-		ID:         GenerateCronID(),
-		Project:    e.name,
-		SessionKey: msg.SessionKey,
-		CronExpr:   cronExpr,
-		Prompt:     prompt,
-		Enabled:    true,
-		CreatedAt:  time.Now(),
+		ID:              GenerateCronID(),
+		Project:         e.name,
+		SessionKey:      msg.SessionKey,
+		RouteSessionKey: msg.OriginSessionKey,
+		CronExpr:        cronExpr,
+		Prompt:          prompt,
+		Enabled:         true,
+		CreatedAt:       time.Now(),
 	}
 
 	if err := e.cronScheduler.AddJob(job); err != nil {
@@ -14673,13 +14685,14 @@ func (e *Engine) cmdCronAddExec(p Platform, msg *Message, args []string) {
 	shellCmd := strings.Join(args[5:], " ")
 
 	job := &CronJob{
-		ID:         GenerateCronID(),
-		Project:    e.name,
-		SessionKey: msg.SessionKey,
-		CronExpr:   cronExpr,
-		Exec:       shellCmd,
-		Enabled:    true,
-		CreatedAt:  time.Now(),
+		ID:              GenerateCronID(),
+		Project:         e.name,
+		SessionKey:      msg.SessionKey,
+		RouteSessionKey: msg.OriginSessionKey,
+		CronExpr:        cronExpr,
+		Exec:            shellCmd,
+		Enabled:         true,
+		CreatedAt:       time.Now(),
 	}
 
 	if err := e.cronScheduler.AddJob(job); err != nil {

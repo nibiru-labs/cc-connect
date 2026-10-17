@@ -2,6 +2,9 @@ package core
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +18,26 @@ type usPlatform struct {
 	mu   sync.Mutex
 	outs []usOut
 }
+
+type usCronPlatform struct {
+	*usPlatform
+	muRoutes sync.Mutex
+	routes   []string
+}
+
+func (p *usCronPlatform) ReconstructReplyCtx(sessionKey string) (any, error) {
+	p.muRoutes.Lock()
+	p.routes = append(p.routes, sessionKey)
+	p.muRoutes.Unlock()
+	return sessionKey, nil
+}
+
+func (p *usCronPlatform) reconstructedRoutes() []string {
+	p.muRoutes.Lock()
+	defer p.muRoutes.Unlock()
+	return append([]string(nil), p.routes...)
+}
+
 type usOut struct {
 	ctx     any
 	content string
@@ -210,4 +233,132 @@ func TestUnifiedSession_CommandNotTagged(t *testing.T) {
 	if len(a2a.outsFor("ctx-c1")) == 0 {
 		t.Fatalf("/help got no reply; command routing broken under unified session")
 	}
+}
+
+func TestUnifiedSession_CronCreationPersistsDeliveryRoute(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewCronStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler := NewCronScheduler(store)
+	a2a := &usPlatform{n: "a2a"}
+	ding := &usPlatform{n: "dingtalk"}
+	e := NewEngine("sakura", &stubAgent{}, []Platform{a2a, ding}, "", LangEnglish)
+	defer e.cancel()
+	e.SetUnifiedSession(true)
+	e.SetAdminFrom("admin")
+	e.cronScheduler = scheduler
+
+	e.handleMessage(a2a, &Message{
+		SessionKey: "a2a:c1", Platform: "a2a", UserID: "admin",
+		Content: "/cron add 0 6 * * * prepare report", ReplyCtx: "ctx-a2a",
+	})
+	e.handleMessage(ding, &Message{
+		SessionKey: "dingtalk:cid9:u7", Platform: "dingtalk", UserID: "admin",
+		Content: "/cron addexec 0 7 * * * echo ready", ReplyCtx: "ctx-ding",
+	})
+
+	jobs := store.List()
+	if len(jobs) != 2 {
+		t.Fatalf("created cron jobs = %d, want 2", len(jobs))
+	}
+	wantRoutes := map[string]string{
+		"prepare report": "a2a:c1",
+		"echo ready":     "dingtalk:cid9:u7",
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "crons", "jobs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted []map[string]any
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range jobs {
+		wantRoute, ok := wantRoutes[job.Prompt]
+		if !ok {
+			wantRoute, ok = wantRoutes[job.Exec]
+		}
+		if !ok {
+			t.Fatalf("unexpected cron job prompt=%q exec=%q", job.Prompt, job.Exec)
+		}
+		if got := persistedRouteForID(t, persisted, job.ID); got != wantRoute {
+			t.Errorf("persisted route for %q = %q, want %q", job.ID, got, wantRoute)
+		}
+	}
+	if jobs[0].SessionKey != UnifiedSessionKey("sakura") || jobs[1].SessionKey != UnifiedSessionKey("sakura") {
+		t.Fatalf("cron execution identity keys = %q, %q; want unified identity %q", jobs[0].SessionKey, jobs[1].SessionKey, UnifiedSessionKey("sakura"))
+	}
+}
+
+func TestUnifiedSession_CronRouteSurvivesRestartAndExecutesOnUnifiedSession(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "crons"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := `[{"id":"unified-cron","project":"sakura","session_key":"unified:sakura","route_session_key":"a2a:c1","cron_expr":"0 6 * * *","prompt":"scheduled report","enabled":true}]`
+	if err := os.WriteFile(filepath.Join(dir, "crons", "jobs.json"), []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewCronStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := store.Get("unified-cron")
+	if job == nil {
+		t.Fatal("persisted cron job did not load after restart")
+	}
+
+	a2a := &usCronPlatform{usPlatform: &usPlatform{n: "a2a"}}
+	ding := &usCronPlatform{usPlatform: &usPlatform{n: "dingtalk"}}
+	session := newResultAgentSession("report complete")
+	e := NewEngine("sakura", &resultAgent{session: session}, []Platform{a2a, ding}, "", LangEnglish)
+	defer e.cancel()
+	e.SetUnifiedSession(true)
+	scheduler := NewCronScheduler(store)
+	e.cronScheduler = scheduler
+	scheduler.RegisterEngine("sakura", e)
+	if err := scheduler.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer scheduler.Stop()
+
+	scheduler.mu.RLock()
+	_, scheduled := scheduler.entries[job.ID]
+	scheduler.mu.RUnlock()
+	if !scheduled {
+		t.Fatal("persisted unified cron job was not scheduled after restart")
+	}
+	if err := e.ExecuteCronJob(job); err != nil {
+		t.Fatalf("ExecuteCronJob() after restart: %v", err)
+	}
+
+	if got := a2a.reconstructedRoutes(); len(got) != 1 || got[0] != "a2a:c1" {
+		t.Fatalf("A2A reply-context routes = %v, want [a2a:c1]", got)
+	}
+	if got := len(a2a.outsFor("a2a:c1")); got == 0 {
+		t.Fatalf("A2A route received no cron output")
+	}
+	if got := len(ding.outsFor("dingtalk:cid9:u7")); got != 0 {
+		t.Fatalf("DingTalk received %d outputs, want none", got)
+	}
+	if got := len(e.sessions.ListSessions(UnifiedSessionKey("sakura"))); got != 1 {
+		t.Fatalf("unified execution session count = %d, want 1", got)
+	}
+	if got := len(e.sessions.ListSessions("a2a:c1")); got != 0 {
+		t.Fatalf("route key created %d agent sessions, want none", got)
+	}
+}
+
+func persistedRouteForID(t *testing.T, jobs []map[string]any, id string) string {
+	t.Helper()
+	for _, job := range jobs {
+		if job["id"] == id {
+			route, _ := job["route_session_key"].(string)
+			return route
+		}
+	}
+	t.Fatalf("cron job %q was not persisted", id)
+	return ""
 }
