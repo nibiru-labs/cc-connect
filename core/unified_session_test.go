@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -235,6 +237,29 @@ func TestUnifiedSession_CommandNotTagged(t *testing.T) {
 	}
 }
 
+func TestUnifiedSession_CronCLIEnvironmentKeepsUnifiedIdentityWithoutStaticRoute(t *testing.T) {
+	agent := &sessionEnvRecordingAgent{}
+	a2a := &usPlatform{n: "a2a"}
+	e := NewEngine("sakura", agent, []Platform{a2a}, "", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+	e.SetUnifiedSession(true)
+
+	e.handleMessage(a2a, &Message{
+		SessionKey: "a2a:c1", Platform: "a2a", UserID: "admin",
+		Content: "create a cron job", ReplyCtx: "ctx-a2a",
+	})
+
+	usWait(t, "agent session environment", func() bool {
+		return agent.EnvValue("CC_SESSION_KEY") != ""
+	})
+	if got := agent.EnvValue("CC_SESSION_KEY"); got != UnifiedSessionKey("sakura") {
+		t.Fatalf("CC_SESSION_KEY = %q, want unified identity %q", got, UnifiedSessionKey("sakura"))
+	}
+	if got := agent.EnvValue("CC_ROUTE_SESSION_KEY"); got != "" {
+		t.Fatalf("CC_ROUTE_SESSION_KEY = %q, want no static route from the session's first platform", got)
+	}
+}
+
 func TestUnifiedSession_CronCreationPersistsDeliveryRoute(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewCronStore(dir)
@@ -348,6 +373,325 @@ func TestUnifiedSession_CronRouteSurvivesRestartAndExecutesOnUnifiedSession(t *t
 	}
 	if got := len(e.sessions.ListSessions("a2a:c1")); got != 0 {
 		t.Fatalf("route key created %d agent sessions, want none", got)
+	}
+}
+
+func TestUnifiedSession_ModelAPICronCreateRestartAndExecuteUsesOriginalRoute(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewCronStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler := NewCronScheduler(store)
+	a2a := &usCronPlatform{usPlatform: &usPlatform{n: "a2a"}}
+	ding := &usCronPlatform{usPlatform: &usPlatform{n: "dingtalk"}}
+	session := newResultAgentSession("report complete")
+	e := NewEngine("sakura", &resultAgent{session: session}, []Platform{a2a, ding}, "", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+	e.SetUnifiedSession(true)
+	identity := UnifiedSessionKey("sakura")
+	activeSession := e.sessions.GetOrCreateActive(identity)
+	activeLockGen, locked := activeSession.TryLock()
+	if !locked {
+		t.Fatal("failed to lock unified session for active-route fixture")
+	}
+	t.Cleanup(func() { activeSession.Unlock(activeLockGen) })
+	e.interactiveMu.Lock()
+	e.interactiveStates[identity] = &interactiveState{
+		busySession:                 activeSession,
+		currentTurnSessionKey:       identity,
+		currentTurnOriginSessionKey: "a2a:c1",
+		currentTurnLockGen:          activeLockGen,
+	}
+	e.interactiveMu.Unlock()
+
+	api, err := NewAPIServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = api.listener.Close() })
+	api.SetCronScheduler(scheduler)
+	api.RegisterEngine("sakura", e)
+
+	payload, err := json.Marshal(map[string]any{
+		"project": "sakura", "session_key": UnifiedSessionKey("sakura"),
+		"route_session_key": "a2a:c1", "cron_expr": "0 6 * * *", "prompt": "scheduled report",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/cron/add", strings.NewReader(string(payload)))
+	response := httptest.NewRecorder()
+	api.mux.ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("POST /cron/add status = %d, body %s", response.Code, response.Body.String())
+	}
+
+	var created CronJob
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode cron add response: %v", err)
+	}
+	if created.SessionKey != UnifiedSessionKey("sakura") {
+		t.Errorf("created SessionKey = %q, want unified identity %q", created.SessionKey, UnifiedSessionKey("sakura"))
+	}
+	if created.RouteSessionKey != "a2a:c1" {
+		t.Errorf("created RouteSessionKey = %q, want original route a2a:c1", created.RouteSessionKey)
+	}
+	activeSession.Unlock(activeLockGen)
+
+	// Reload the store to exercise the persisted API-created record, then start
+	// a fresh scheduler as a process restart would.
+	restartedStore, err := NewCronStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := restartedStore.Get(created.ID)
+	if job == nil {
+		t.Fatal("API-created cron job did not load after restart")
+	}
+	restartedScheduler := NewCronScheduler(restartedStore)
+	e.cronScheduler = restartedScheduler
+	restartedScheduler.RegisterEngine("sakura", e)
+	if err := restartedScheduler.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { restartedScheduler.Stop() })
+
+	restartedScheduler.mu.RLock()
+	_, scheduled := restartedScheduler.entries[job.ID]
+	restartedScheduler.mu.RUnlock()
+	if !scheduled {
+		t.Error("API-created unified cron job was not scheduled after restart")
+	}
+	if err := e.ExecuteCronJob(job); err != nil {
+		t.Errorf("ExecuteCronJob() after API create/restart: %v", err)
+	} else {
+		if got := a2a.reconstructedRoutes(); len(got) == 0 || got[len(got)-1] != "a2a:c1" {
+			t.Errorf("A2A reconstructed routes = %v, want final route a2a:c1", got)
+		}
+		if got := len(a2a.outsFor("a2a:c1")); got == 0 {
+			t.Error("A2A route received no output from API-created cron job")
+		}
+		if got := len(ding.outsFor("dingtalk:cid9:u7")); got != 0 {
+			t.Errorf("DingTalk received %d outputs, want none", got)
+		}
+	}
+}
+
+func TestCronAddRejectsRouteOnUnconfiguredProjectPlatform(t *testing.T) {
+	store, err := NewCronStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = api.listener.Close() })
+	api.SetCronScheduler(NewCronScheduler(store))
+	e := NewEngine("sakura", &stubAgent{}, []Platform{&usPlatform{n: "a2a"}}, "", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+	e.SetUnifiedSession(true)
+	identity := UnifiedSessionKey("sakura")
+	session := e.sessions.GetOrCreateActive(identity)
+	lockGen, locked := session.TryLock()
+	if !locked {
+		t.Fatal("failed to lock unified session for active-route fixture")
+	}
+	t.Cleanup(func() { session.Unlock(lockGen) })
+	e.interactiveMu.Lock()
+	e.interactiveStates[identity] = &interactiveState{
+		busySession:                 session,
+		currentTurnSessionKey:       identity,
+		currentTurnOriginSessionKey: "other-project-platform:c1",
+		currentTurnLockGen:          lockGen,
+	}
+	e.interactiveMu.Unlock()
+	api.RegisterEngine("sakura", e)
+
+	payload, err := json.Marshal(map[string]any{
+		"project": "sakura", "session_key": UnifiedSessionKey("sakura"),
+		"route_session_key": "a2a:c1", "cron_expr": "0 6 * * *", "prompt": "must reject",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/cron/add", strings.NewReader(string(payload)))
+	response := httptest.NewRecorder()
+	api.mux.ServeHTTP(response, req)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("POST /cron/add with an unconfigured route status = %d, want %d; body: %s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+	if got := len(store.List()); got != 0 {
+		t.Fatalf("unconfigured route persisted %d cron jobs, want none", got)
+	}
+}
+
+func TestUnifiedSession_ModelAPICronUsesCurrentQueuedTurnRouteAfterRestart(t *testing.T) {
+	session := &usSession{events: make(chan Event, 8), release: make(chan struct{}, 8)}
+	ag := &usAgent{sess: session}
+	a2a := &usCronPlatform{usPlatform: &usPlatform{n: "a2a"}}
+	ding := &usCronPlatform{usPlatform: &usPlatform{n: "dingtalk"}}
+	e := NewEngine("us", ag, []Platform{a2a, ding}, "", LangEnglish)
+	e.SetUnifiedSession(true)
+	defer func() {
+		// Release any Send waiting on the test-controlled agent before stopping.
+		for range 3 {
+			session.release <- struct{}{}
+		}
+		_ = e.Stop()
+	}()
+
+	cronDir := t.TempDir()
+	store, err := NewCronStore(cronDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler := NewCronScheduler(store)
+	api, err := NewAPIServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer api.listener.Close()
+	api.SetCronScheduler(scheduler)
+	api.RegisterEngine("us", e)
+
+	// The first A2A turn starts the shared process; a DingTalk message arrives
+	// while it is busy and is processed next by the same unified session.
+	e.handleMessage(a2a, &Message{
+		SessionKey: "a2a:c1", Platform: "a2a", MessageID: "am-first",
+		UserID: "u1", UserName: "A2A", Content: "first turn", ReplyCtx: "ctx-a2a",
+	})
+	usWait(t, "first A2A prompt", func() bool { return len(session.promptList()) == 1 })
+	e.handleMessage(ding, &Message{
+		SessionKey: "dingtalk:cid9:u7", Platform: "dingtalk", MessageID: "dm-second",
+		UserID: "u7", UserName: "DingTalk", Content: "create a scheduled reminder", ReplyCtx: "ctx-ding",
+	})
+	session.release <- struct{}{}
+	usWait(t, "queued DingTalk turn on the same agent session", func() bool { return len(session.promptList()) == 2 })
+	if got := ag.startCount(); got != 1 {
+		t.Fatalf("agent sessions started before cron API call = %d, want one shared process", got)
+	}
+
+	// This stale body route represents the route inherited from the process's
+	// initial A2A turn. The API must derive the live route from the Engine's
+	// trusted current turn, not let the body select a configured platform.
+	payload, err := json.Marshal(map[string]any{
+		"project": "us", "session_key": UnifiedSessionKey("us"),
+		"route_session_key": "a2a:c1", "cron_expr": "0 6 * * *", "prompt": "scheduled reminder",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/cron/add", strings.NewReader(string(payload)))
+	response := httptest.NewRecorder()
+	api.mux.ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("POST /cron/add status = %d, body %s", response.Code, response.Body.String())
+	}
+	var created CronJob
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode cron response: %v", err)
+	}
+	if created.SessionKey != UnifiedSessionKey("us") {
+		t.Fatalf("cron identity = %q, want %q", created.SessionKey, UnifiedSessionKey("us"))
+	}
+	if created.RouteSessionKey != "dingtalk:cid9:u7" {
+		t.Fatalf("cron route = %q, want current DingTalk turn route dingtalk:cid9:u7", created.RouteSessionKey)
+	}
+
+	session.release <- struct{}{}
+	usWait(t, "DingTalk turn reply", func() bool { return len(ding.outsFor("ctx-ding")) > 0 })
+	if got := ag.startCount(); got != 1 {
+		t.Fatalf("agent sessions started after queued turn = %d, want one shared process", got)
+	}
+	usWait(t, "DingTalk turn lock release", func() bool {
+		return !e.sessions.GetOrCreateActive(UnifiedSessionKey("us")).Busy()
+	})
+
+	// Reload the API-created job and start a fresh scheduler, as after restart.
+	restartedStore, err := NewCronStore(cronDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := restartedStore.Get(created.ID)
+	if job == nil {
+		t.Fatal("API-created cron job did not load after restart")
+	}
+	restartedScheduler := NewCronScheduler(restartedStore)
+	e.cronScheduler = restartedScheduler
+	restartedScheduler.RegisterEngine("us", e)
+	if err := restartedScheduler.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer restartedScheduler.Stop()
+	restartedScheduler.mu.RLock()
+	_, scheduled := restartedScheduler.entries[job.ID]
+	restartedScheduler.mu.RUnlock()
+	if !scheduled {
+		t.Fatal("DingTalk-routed unified cron job was not scheduled after restart")
+	}
+
+	execDone := make(chan error, 1)
+	go func() { execDone <- e.ExecuteCronJob(job) }()
+	promptDeadline := time.After(5 * time.Second)
+	for len(session.promptList()) < 3 {
+		select {
+		case err := <-execDone:
+			t.Fatalf("ExecuteCronJob() returned before sending the cron prompt: %v", err)
+		case <-promptDeadline:
+			t.Fatal("timed out waiting for cron agent prompt")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	session.release <- struct{}{}
+	select {
+	case err := <-execDone:
+		if err != nil {
+			t.Fatalf("ExecuteCronJob() after API create/restart: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for restarted cron execution")
+	}
+	if got := len(ding.outsFor("dingtalk:cid9:u7")); got == 0 {
+		t.Fatal("DingTalk route received no cron output after restart")
+	}
+	if got := len(a2a.outsFor("a2a:c1")); got != 0 {
+		t.Fatalf("A2A route received %d cron outputs, want none", got)
+	}
+}
+
+func TestUnifiedSession_ModelAPICronRejectsCallerRouteWithoutActiveTurn(t *testing.T) {
+	store, err := NewCronStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := NewAPIServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer api.listener.Close()
+	api.SetCronScheduler(NewCronScheduler(store))
+	e := NewEngine("us", &stubAgent{}, []Platform{&usPlatform{n: "a2a"}, &usPlatform{n: "dingtalk"}}, "", LangEnglish)
+	defer e.Stop()
+	e.SetUnifiedSession(true)
+	api.RegisterEngine("us", e)
+
+	payload, err := json.Marshal(map[string]any{
+		"project": "us", "session_key": UnifiedSessionKey("us"),
+		"route_session_key": "a2a:c1", "cron_expr": "0 6 * * *", "prompt": "must fail closed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/cron/add", strings.NewReader(string(payload)))
+	response := httptest.NewRecorder()
+	api.mux.ServeHTTP(response, req)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("POST /cron/add without an active turn status = %d, want %d; body: %s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+	if got := len(store.List()); got != 0 {
+		t.Fatalf("caller-selected route persisted %d cron jobs without an active turn, want none", got)
 	}
 }
 

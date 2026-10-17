@@ -131,7 +131,6 @@ func runCronAdd(args []string) {
 	if sessionKey == "" {
 		sessionKey = os.Getenv("CC_SESSION_KEY")
 	}
-
 	// If cron expr not provided via --cron, try positional: first 5 fields are cron, rest is prompt/exec
 	if cronExpr == "" && len(positional) >= 6 {
 		cronExpr = strings.Join(positional[:5], " ")

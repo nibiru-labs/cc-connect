@@ -539,6 +539,8 @@ type workspaceInitFlow struct {
 // sends it after the current turn completes to avoid mid-turn interference.
 type queuedMessage struct {
 	messageID         string
+	sessionKey        string
+	originSessionKey  string
 	platform          Platform
 	replyCtx          any
 	content           string
@@ -559,28 +561,31 @@ type interactiveState struct {
 	// busySession is the core.Session whose busy lock guards the in-flight
 	// turn. Set by getOrCreateInteractiveStateWith so /stop can release the
 	// lock after tearing the turn down (#1830).
-	busySession              *Session
-	platform                 Platform
-	replyCtx                 any
-	currentMessageID         string
-	lastRecallProbeMessageID string
-	lastRecallProbeAt        time.Time
-	recallProbeInFlight      bool
-	workspaceDir             string
-	agent                    Agent
-	mu                       sync.Mutex
-	stopCh                   chan struct{}
-	stopped                  bool
-	pending                  *pendingPermission
-	pendingMessages          []queuedMessage // messages queued while session was busy
-	approveAll               bool            // when true, auto-approve all permission requests for this session
-	fromVoice                bool            // true if current turn originated from voice transcription
-	sideText                 string
-	deleteMode               *deleteModeState
-	modelSwitch              *modelSwitchState
-	pendingProviderAdd       *pendingProviderAddState
-	lastAutoCompressAt       time.Time
-	lastAutoCompressTokens   int
+	busySession                 *Session
+	platform                    Platform
+	replyCtx                    any
+	currentMessageID            string
+	currentTurnSessionKey       string
+	currentTurnOriginSessionKey string
+	currentTurnLockGen          uint64
+	lastRecallProbeMessageID    string
+	lastRecallProbeAt           time.Time
+	recallProbeInFlight         bool
+	workspaceDir                string
+	agent                       Agent
+	mu                          sync.Mutex
+	stopCh                      chan struct{}
+	stopped                     bool
+	pending                     *pendingPermission
+	pendingMessages             []queuedMessage // messages queued while session was busy
+	approveAll                  bool            // when true, auto-approve all permission requests for this session
+	fromVoice                   bool            // true if current turn originated from voice transcription
+	sideText                    string
+	deleteMode                  *deleteModeState
+	modelSwitch                 *modelSwitchState
+	pendingProviderAdd          *pendingProviderAddState
+	lastAutoCompressAt          time.Time
+	lastAutoCompressTokens      int
 
 	// Unsolicited event reader: a background goroutine that consumes agent
 	// events between user-initiated turns (e.g. background task completions).
@@ -1502,6 +1507,49 @@ func (e *Engine) ActiveSessionKeys() []string {
 	return keys
 }
 
+// currentUnifiedRouteForSession returns the trusted source route for the
+// currently locked turn of a unified agent session. The route is recorded from
+// inbound Message.OriginSessionKey and advances with queued turns; caller JSON
+// must never select it. The session lock generation prevents a stale route
+// from a previous turn being used in the gap before a newly acquired turn is
+// recorded.
+func (e *Engine) currentUnifiedRouteForSession(sessionKey string) (string, bool) {
+	if !e.unifiedSession || sessionKey != UnifiedSessionKey(e.name) {
+		return "", false
+	}
+
+	e.interactiveMu.Lock()
+	defer e.interactiveMu.Unlock()
+
+	var route string
+	matches := 0
+	for _, state := range e.interactiveStates {
+		if state == nil {
+			continue
+		}
+		state.mu.Lock()
+		if state.currentTurnSessionKey != sessionKey || state.currentTurnOriginSessionKey == "" || state.busySession == nil || state.currentTurnLockGen == 0 {
+			state.mu.Unlock()
+			continue
+		}
+		lockGen, busy := state.busySession.busyLockGeneration()
+		if !busy || lockGen != state.currentTurnLockGen {
+			state.mu.Unlock()
+			continue
+		}
+		candidate := state.currentTurnOriginSessionKey
+		state.mu.Unlock()
+		if route != "" {
+			// A shared identity must not choose between concurrent workspace
+			// turns. Fail closed if more than one active route claims it.
+			return "", false
+		}
+		route = candidate
+		matches++
+	}
+	return route, matches == 1 && route != ""
+}
+
 // ExecuteCronJob runs a cron job by injecting a synthetic message into the engine.
 // It finds the platform that owns the session key, reconstructs a reply context,
 // and processes the message as if the user sent it.
@@ -1621,13 +1669,14 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	content := job.Prompt
 
 	msg := &Message{
-		SessionKey:   sessionKey,
-		Platform:     platformName,
-		UserID:       "cron",
-		UserName:     "cron",
-		Content:      content,
-		ReplyCtx:     replyCtx,
-		ModeOverride: job.Mode,
+		SessionKey:       sessionKey,
+		OriginSessionKey: job.RouteSessionKey,
+		Platform:         platformName,
+		UserID:           "cron",
+		UserName:         "cron",
+		Content:          content,
+		ReplyCtx:         replyCtx,
+		ModeOverride:     job.Mode,
 	}
 
 	// Resolve workspace-specific agent and sessions for multi-workspace mode.
@@ -3474,6 +3523,8 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
 		messageID:         msg.MessageID,
+		sessionKey:        msg.SessionKey,
+		originSessionKey:  msg.OriginSessionKey,
 		platform:          p,
 		replyCtx:          msg.ReplyCtx,
 		content:           msg.Content,
@@ -4034,6 +4085,9 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	state.platform = p
 	state.replyCtx = msg.ReplyCtx
 	state.currentMessageID = msg.MessageID
+	state.currentTurnSessionKey = msg.SessionKey
+	state.currentTurnOriginSessionKey = msg.OriginSessionKey
+	state.currentTurnLockGen = lockGen
 	state.currentTurnUserMessageTimeMs = msg.UserMessageTimeMs
 	state.mu.Unlock()
 	stopRecallMonitor := e.startMessageRecallMonitor(interactiveKey)
@@ -6522,6 +6576,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.platform = queued.platform
 				state.replyCtx = queued.replyCtx
 				state.currentMessageID = queued.messageID
+				state.currentTurnSessionKey = queued.sessionKey
+				state.currentTurnOriginSessionKey = queued.originSessionKey
+				state.currentTurnLockGen = lockGen
 				state.fromVoice = queued.fromVoice
 				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 				state.mu.Unlock()
@@ -6876,6 +6933,10 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.platform = queued.platform
 		state.replyCtx = queued.replyCtx
 		state.currentMessageID = queued.messageID
+		state.currentTurnSessionKey = queued.sessionKey
+		state.currentTurnOriginSessionKey = queued.originSessionKey
+		state.currentTurnLockGen = lockGen
+		state.busySession = session
 		state.fromVoice = queued.fromVoice
 		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 		state.mu.Unlock()
