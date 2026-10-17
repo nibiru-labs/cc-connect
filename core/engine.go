@@ -414,10 +414,10 @@ type Engine struct {
 	references          ReferenceRenderCfg
 	relayManager        *RelayManager
 	eventIdleTimeout    time.Duration
-	staleLockBreakAfter time.Duration // busy-lock stale-break threshold; 0 disables
-	maxTurnTime         time.Duration // absolute wall-clock cap per turn (0 = disabled)
+	staleLockBreakAfter time.Duration   // busy-lock stale-break threshold; 0 disables
+	maxTurnTime         time.Duration   // absolute wall-clock cap per turn (0 = disabled)
 	lifecycle           nibiruLifecycle // rotate/compress-by-percent settings; nibiru#836
-	firstEventTimeout   time.Duration // max wait for the first agent event of a turn (0 = disabled); nibiru#836
+	firstEventTimeout   time.Duration   // max wait for the first agent event of a turn (0 = disabled); nibiru#836
 	// agentSessionIdleTimeoutNanos 在单轮正常结束后关闭空闲的 live agent 进程，
 	// 同时保留已保存的 session ID，便于下次继续恢复。
 	agentSessionIdleTimeoutNanos atomic.Int64
@@ -3211,6 +3211,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	if gen, locked := session.TryLock(); locked {
 		lockGen = gen
 	} else {
+		if receiveAfterBusyTryLockHook != nil {
+			receiveAfterBusyTryLockHook()
+		}
 		if e.stopCurrentMessageIfRecalled(interactiveKey) {
 			if g, ok := e.waitForSessionLock(session, recalledStopLockWait); ok {
 				lockGen = g

@@ -257,6 +257,10 @@ collect:
 // rotateBeforeCommitHook is a test seam: it runs right before the atomic commit.
 var rotateBeforeCommitHook func()
 
+// receiveAfterBusyTryLockHook is a test seam for pausing a real inbound turn
+// after it observes the session busy and before it attempts to queue.
+var receiveAfterBusyTryLockHook func()
+
 // commitRotate is the single atomic transition of a rotation (nibiru#836 review P1).
 // Under interactiveMu → state.mu (the same order queueMessageForBusySession uses) it
 // re-checks that no message is queued, detaches the old agent, removes the state from
