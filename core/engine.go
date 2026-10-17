@@ -485,6 +485,13 @@ type Engine struct {
 	interactiveMu     sync.Mutex
 	interactiveStates map[string]*interactiveState // key = sessionKey
 
+	// Relay sessions run outside interactiveStates. Keep a private inventory
+	// while HandleRelay is starting, consuming, or draining their events so the
+	// runtime snapshot cannot report a complete zero during relay work.
+	relayRuntimeMu       sync.Mutex
+	relayRuntimeNextID   uint64
+	relayRuntimeSessions map[uint64]AgentSession
+
 	// Teardown tracking. A session's state is removed from interactiveStates
 	// as soon as /stop is issued, but its OS process can live on for up to
 	// closeTimeout while it drains stdin and runs Stop hooks. Without the two
@@ -16354,6 +16361,13 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 		return "", err
 	}
 	session := sessions.GetOrCreateActive(relaySessionKey)
+	runtimeSessionID := e.beginRelayRuntimeSession()
+	trackedRuntimeSession := true
+	defer func() {
+		if trackedRuntimeSession {
+			e.endRelayRuntimeSession(runtimeSessionID)
+		}
+	}()
 
 	if inj, ok := agent.(SessionEnvInjector); ok {
 		envVars := []string{
@@ -16387,6 +16401,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 			return "", fmt.Errorf("start relay session: %w", err)
 		}
 	}
+	e.setRelayRuntimeSession(runtimeSessionID, agentSession)
 
 	saveRelaySessionID := func(id string, force bool) {
 		if id == "" {
@@ -16470,7 +16485,8 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 			// Relay timed out. Let the agent finish its turn in the
 			// background so the session state is saved cleanly and the
 			// session remains resumable for the next relay call.
-			go e.drainRelaySession(agentSession, session, sessions, agent.Name(), relaySessionKey)
+			trackedRuntimeSession = false // the drain goroutine owns the inventory entry
+			go e.drainRelaySession(agentSession, session, sessions, agent.Name(), relaySessionKey, runtimeSessionID)
 			return relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
 		}
 	}
@@ -16507,7 +16523,8 @@ func relayPartialResponseOrError(ctxErr error, textParts []string, fromProject, 
 // agent finish its current turn (saving the session ID for future resumption),
 // auto-approves any permission requests, and then closes the session. A 10-minute
 // safety timeout prevents the goroutine from leaking if the agent hangs.
-func (e *Engine) drainRelaySession(agentSession AgentSession, session *Session, sessions *SessionManager, agentName, relaySessionKey string) {
+func (e *Engine) drainRelaySession(agentSession AgentSession, session *Session, sessions *SessionManager, agentName, relaySessionKey string, runtimeSessionID uint64) {
+	defer e.endRelayRuntimeSession(runtimeSessionID)
 	timer := time.NewTimer(10 * time.Minute)
 	defer timer.Stop()
 
