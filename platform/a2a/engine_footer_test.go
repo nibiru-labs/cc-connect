@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,13 +15,15 @@ import (
 )
 
 type footerTestAgent struct {
-	response string
-	received chan<- string
+	response   string
+	received   chan<- string
+	startCalls atomic.Int32
 }
 
 func (a *footerTestAgent) Name() string     { return "a2a-footer-test" }
 func (a *footerTestAgent) GetModel() string { return "gpt-6-luna" }
 func (a *footerTestAgent) StartSession(context.Context, string) (core.AgentSession, error) {
+	a.startCalls.Add(1)
 	return &footerTestSession{response: a.response, received: a.received, events: make(chan core.Event, 1)}, nil
 }
 func (a *footerTestAgent) ListSessions(context.Context) ([]core.AgentSessionInfo, error) {
@@ -170,6 +173,89 @@ func TestCoreA2AReplyFooterEmptyResultDoesNotPublishAndAcks(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	if sent := c.sentCopy(); len(sent) != 0 {
 		t.Fatalf("empty EventResult published with footer enabled: %+v", sent)
+	}
+}
+
+func TestCoreA2ABlankInboundSettlesWithoutAgent(t *testing.T) {
+	ids := []string{"empty-inbound", "whitespace-inbound"}
+	c := &fakeClient{pending: []Inbound{
+		in(ids[0], "empty-inbound-conversation", "grok", ""),
+		in(ids[1], "whitespace-inbound-conversation", "grok", " \t\n"),
+	}}
+	acker := newL2Acker(c, 3).(*DefaultAcker)
+	p := newTestPlatform(t, c, acker, nil)
+	agent := &footerTestAgent{response: "unexpected", received: make(chan string, len(ids))}
+	e := core.NewEngine("a2a-blank-inbound-test", agent, []core.Platform{p}, "", core.LangEnglish)
+	if err := e.Start(); err != nil {
+		t.Fatalf("start engine: %v", err)
+	}
+	t.Cleanup(func() { _ = e.Stop() })
+
+	eventuallyAcked(t, c, ids...)
+	eventually(t, "blank inbounds released from platform tracking", func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		for _, id := range ids {
+			if p.inflight[id] || p.done[id].IsZero() {
+				return false
+			}
+		}
+		return true
+	})
+
+	if got := agent.startCalls.Load(); got != 0 {
+		t.Fatalf("agent started %d sessions for blank A2A inbounds, want none", got)
+	}
+	if got := len(agent.received); got != 0 {
+		t.Fatalf("agent received %d prompts for blank A2A inbounds, want none", got)
+	}
+	if got := c.sentCopy(); len(got) != 0 {
+		t.Fatalf("blank A2A inbounds sent replies %+v, want none", got)
+	}
+	acked := c.ackedCopy()
+	for _, id := range ids {
+		count := 0
+		for _, got := range acked {
+			if got == id {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("message %q ack count = %d, want exactly one; all acks=%v", id, count, acked)
+		}
+	}
+
+	acker.mu.Lock()
+	var stillTracked []string
+	for _, id := range ids {
+		if _, ok := acker.msgs[id]; ok {
+			stillTracked = append(stillTracked, id)
+		}
+		for _, tracked := range acker.sessions {
+			if ackContains(tracked, id) {
+				stillTracked = append(stillTracked, id)
+				break
+			}
+		}
+	}
+	acker.mu.Unlock()
+	if len(stillTracked) != 0 {
+		t.Fatalf("blank A2A messages remained in Acker state: %v", stillTracked)
+	}
+
+	p.empty.mu.Lock()
+	var stillPendingEmpty []string
+	for _, id := range ids {
+		if _, ok := p.empty.inboundEmpty[id]; ok {
+			stillPendingEmpty = append(stillPendingEmpty, id)
+		}
+		if _, ok := p.empty.realSent[id]; ok {
+			stillPendingEmpty = append(stillPendingEmpty, id)
+		}
+	}
+	p.empty.mu.Unlock()
+	if len(stillPendingEmpty) != 0 {
+		t.Fatalf("blank A2A messages remained in empty-breaker turn state: %v", stillPendingEmpty)
 	}
 }
 

@@ -27,6 +27,16 @@ func (a *stubAgent) StartSession(_ context.Context, _ string) (AgentSession, err
 func (a *stubAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) { return nil, nil }
 func (a *stubAgent) Stop() error                                                { return nil }
 
+type countingStubAgent struct {
+	stubAgent
+	startCalls atomic.Int32
+}
+
+func (a *countingStubAgent) StartSession(ctx context.Context, sessionID string) (AgentSession, error) {
+	a.startCalls.Add(1)
+	return a.stubAgent.StartSession(ctx, sessionID)
+}
+
 type stubAgentSession struct{}
 
 func (s *stubAgentSession) Send(_ string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
@@ -499,6 +509,45 @@ func TestProcessInteractiveEvents_FinishTurnOKForSilentReply(t *testing.T) {
 	fins := p.finishes()
 	if len(fins) != 1 || !fins[0].ok {
 		t.Fatalf("finishes = %#v, want one ok finish", fins)
+	}
+}
+
+func TestHandleMessage_EmptyInboundFinishesTurnWithoutStartingAgent(t *testing.T) {
+	tests := []struct {
+		name         string
+		content      string
+		extraContent string
+	}{
+		{name: "empty"},
+		{name: "whitespace", content: " \t\n"},
+		{name: "whitespace extra content", extraContent: " \t\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := &countingStubAgent{}
+			p := &stubTurnFinisherPlatform{stubPlatformEngine: stubPlatformEngine{n: "a2a"}}
+			e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+			defer func() { _ = e.Stop() }()
+
+			replyCtx := "ctx-empty"
+			e.ReceiveMessage(p, &Message{
+				SessionKey:   "a2a:empty",
+				Platform:     "a2a",
+				Content:      tt.content,
+				ExtraContent: tt.extraContent,
+				ReplyCtx:     replyCtx,
+			})
+
+			if got := agent.startCalls.Load(); got != 0 {
+				t.Fatalf("agent started %d sessions for empty inbound, want none", got)
+			}
+			if got := p.finishes(); len(got) != 1 || !got[0].ok || got[0].replyCtx != replyCtx {
+				t.Fatalf("finishes = %#v, want one successful finish for %q", got, replyCtx)
+			}
+			if got := p.getSent(); len(got) != 0 {
+				t.Fatalf("empty inbound sent replies %q, want none", got)
+			}
+		})
 	}
 }
 

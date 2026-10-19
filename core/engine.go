@@ -3097,7 +3097,12 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	}
 
 	content := strings.TrimSpace(msg.Content)
-	if content == "" && msg.ExtraContent == "" && len(msg.Images) == 0 && len(msg.Files) == 0 && msg.Location == nil {
+	if content == "" && strings.TrimSpace(msg.ExtraContent) == "" && len(msg.Images) == 0 && len(msg.Files) == 0 && msg.Location == nil {
+		// A contentless inbound is a terminal no-op. Let queue-backed platforms
+		// settle it so it can be acked instead of remaining tracked indefinitely.
+		if finisher, ok := p.(TurnFinisher); ok {
+			finisher.FinishTurn(e.ctx, msg.ReplyCtx, true)
+		}
 		return
 	}
 
