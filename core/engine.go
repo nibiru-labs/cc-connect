@@ -3098,6 +3098,13 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 
 	content := strings.TrimSpace(msg.Content)
 	if content == "" && msg.ExtraContent == "" && len(msg.Images) == 0 && len(msg.Files) == 0 && msg.Location == nil {
+		// A contentless inbound is a terminal no-op: no model turn runs. It is
+		// still a turn for queue-backed platforms, so settle it here instead of
+		// returning early and leaving the message tracked (and its id blocked
+		// from re-admission) forever. nibiru#1431.
+		if finisher, ok := p.(TurnFinisher); ok {
+			finisher.FinishTurn(e.ctx, msg.ReplyCtx, true)
+		}
 		return
 	}
 
