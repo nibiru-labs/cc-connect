@@ -245,6 +245,24 @@ type TurnFinisher interface {
 	FinishTurn(ctx context.Context, replyCtx any, ok bool)
 }
 
+// SystemResponseKind identifies a system-authored response by intent rather
+// than by matching its rendered text. User content that happens to equal a
+// system response remains ordinary user content.
+type SystemResponseKind uint8
+
+const (
+	SystemResponseRateLimited SystemResponseKind = iota + 1
+)
+
+// SystemResponseSuppressor lets a platform suppress a typed engine response
+// and settle its inbound turn itself. It must return true only when the
+// response was suppressed and any platform-specific settlement was completed.
+// This is useful for message buses where publishing engine-control text would
+// trigger another peer turn.
+type SystemResponseSuppressor interface {
+	SuppressSystemResponse(ctx context.Context, replyCtx any, kind SystemResponseKind) bool
+}
+
 // AtMentionSender is an optional interface for platforms that support @mention in
 // reply messages (e.g. DingTalk). Platforms that implement this interface can
 // include @user notifications when replying in group chats.
