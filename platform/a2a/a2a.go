@@ -55,6 +55,7 @@ type Platform struct {
 	roster   *rosterReceiver
 	interval time.Duration
 	maxChunk int
+	empty    *emptyBreaker // nibiru#1346 empty-reply loop guard
 
 	// pong answers liveness pings at platform level and reports whether the
 	// message was consumed. TODO(836-a2a-ack): wire to pong.go; nil = not handled.
@@ -125,6 +126,7 @@ func newPlatform(c Client, a Acker, opts map[string]any) *Platform {
 	return &Platform{
 		client: c, acker: a, allow: allow, roster: newRosterReceiver(opts, allow), interval: interval, maxChunk: maxChunk,
 		inflight: map[string]bool{}, done: map[string]time.Time{}, replies: map[string]int{},
+		empty: newEmptyBreaker(emptyLimitOpt(opts["empty_reply_limit"])),
 	}
 }
 
@@ -267,7 +269,20 @@ func (p *Platform) dispatchRoster(ctx context.Context, handler core.MessageHandl
 }
 
 func (p *Platform) dispatchMessage(handler core.MessageHandler, m Inbound, content, rosterTransferKey string) {
+	if rosterTransferKey == "" && p.empty.shouldDrop(m.ConversationID, content) {
+		// Keep breaker settlement on the Acker path so per-ID retry/ACK state
+		// remains consistent with every other accepted inbound message.
+		slog.Warn("a2a: empty-reply breaker open, settling without model dispatch",
+			"conversation", m.ConversationID, "message_id", m.MessageID, "sender", m.SenderID,
+			"consecutive_empty", p.empty.count(m.ConversationID))
+		p.acker.TurnSucceededIDs([]string{m.MessageID})
+		p.release(m.MessageID, true)
+		return
+	}
 	key := "a2a:" + m.ConversationID
+	if rosterTransferKey == "" {
+		p.empty.begin(m.MessageID, content)
+	}
 	p.acker.Track(key, []string{m.MessageID})
 	handler(p, &core.Message{
 		SessionKey: key,
@@ -303,6 +318,27 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 	return p.send(ctx, replyCtx, content)
 }
 
+// SendWithStatusFooter implements core.StatusFooterSender. Classify the raw
+// body before composing the footer so metadata cannot turn an empty reply into
+// a message that wakes an A2A peer.
+func (p *Platform) SendWithStatusFooter(ctx context.Context, replyCtx any, content, footer string) error {
+	if isEmptyReply(content) {
+		return p.send(ctx, replyCtx, content)
+	}
+	return p.send(ctx, replyCtx, appendInlineStatusFooter(content, footer))
+}
+
+func appendInlineStatusFooter(content, footer string) string {
+	if footer == "" {
+		return content
+	}
+	content = strings.TrimRight(content, "\n")
+	if content == "" {
+		return "*" + footer + "*"
+	}
+	return content + "\n\n*" + footer + "*"
+}
+
 func (p *Platform) send(ctx context.Context, replyCtx any, content string) error {
 	rc, ok := replyCtx.(*replyContext)
 	if !ok || rc == nil || len(rc.MessageIDs) == 0 {
@@ -310,6 +346,10 @@ func (p *Platform) send(ctx context.Context, replyCtx any, content string) error
 	}
 	first := rc.MessageIDs[0]
 	replyTo := rc.MessageIDs[len(rc.MessageIDs)-1]
+	if isEmptyReply(content) {
+		slog.Info("a2a: suppressed empty reply", "conversation", rc.ConversationID, "reply_to", replyTo)
+		return nil
+	}
 
 	p.mu.Lock()
 	n := p.replies[first]
@@ -328,6 +368,9 @@ func (p *Platform) send(ctx context.Context, replyCtx any, content string) error
 	p.mu.Lock()
 	p.replies[first]++
 	p.mu.Unlock()
+	if rc.rosterTransferKey == "" {
+		p.empty.delivered(first)
+	}
 	return nil
 }
 
@@ -340,6 +383,12 @@ func (p *Platform) FinishTurn(_ context.Context, replyCtx any, ok bool) {
 		return
 	}
 	sessionKey := "a2a:" + rc.ConversationID
+	if rc.rosterTransferKey == "" {
+		if n := p.empty.finish(rc.ConversationID, rc.MessageIDs[0]); n >= p.empty.limit {
+			slog.Warn("a2a: conversation hit empty-reply limit; further empty messages will be settled without model dispatch",
+				"conversation", rc.ConversationID, "consecutive_empty", n)
+		}
+	}
 	if ok {
 		if rc.rosterTransferKey != "" && p.roster != nil {
 			if err := p.roster.markDelivered(rc.rosterTransferKey, rc.MessageIDs[0]); err != nil {
@@ -353,6 +402,30 @@ func (p *Platform) FinishTurn(_ context.Context, replyCtx any, ok bool) {
 		p.acker.TurnFailedIDs(sessionKey, rc.MessageIDs, fmt.Errorf("a2a: turn did not complete"))
 	}
 	p.finish(rc, ok)
+}
+
+// SuppressSystemResponse implements core.SystemResponseSuppressor. A2A peers
+// must not receive an engine rate-limit notice as a new conversation prompt.
+// A ready roster payload has not reached the model, so it remains retryable.
+func (p *Platform) SuppressSystemResponse(_ context.Context, replyCtx any, kind core.SystemResponseKind) bool {
+	if kind != core.SystemResponseRateLimited {
+		return false
+	}
+	rc, ok := replyCtx.(*replyContext)
+	if !ok || rc == nil || len(rc.MessageIDs) == 0 {
+		return false
+	}
+	p.empty.discard(rc.MessageIDs[0])
+	if rc.rosterTransferKey != "" {
+		p.acker.TurnFailedIDs("a2a:"+rc.ConversationID, rc.MessageIDs, fmt.Errorf("a2a: roster turn rate limited before model dispatch"))
+		p.finish(rc, false)
+		return true
+	}
+	p.acker.TurnSucceededIDs(rc.MessageIDs)
+	p.finish(rc, true)
+	slog.Info("a2a: suppressed system response and settled inbound turn",
+		"kind", "rate_limited", "conversation", rc.ConversationID, "message_ids", rc.MessageIDs)
+	return true
 }
 
 func (p *Platform) finish(rc *replyContext, ok bool) {
@@ -404,4 +477,21 @@ func cut(s string, max int) []string {
 		parts = append(parts, s)
 	}
 	return parts
+}
+
+// emptyLimitOpt parses the optional empty_reply_limit option (0 = default).
+func emptyLimitOpt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case string:
+		if i, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
+			return i
+		}
+	}
+	return 0
 }
