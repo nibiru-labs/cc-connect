@@ -33,6 +33,13 @@ type replyContext struct {
 	ConversationID    string
 	MessageIDs        []string // inbound messages covered by this turn; acked once the turn succeeds
 	rosterTransferKey string   // non-empty only for a completely validated roster transfer
+
+	// inboundEmpty records that the inbound message of this turn carried no
+	// real content, and replied records that a real (non-empty) reply was
+	// delivered. Together they decide whether the exchange counts as empty for
+	// the per-conversation breaker. nibiru#1346.
+	inboundEmpty bool
+	replied      bool
 }
 
 // Acker is implemented by L2 (ack.go).
@@ -66,6 +73,9 @@ type Platform struct {
 	replies  map[string]int // successful Reply/Send count per first message id
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
+
+	// breaker stops conversations whose turns keep exchanging empty content.
+	breaker *emptyExchangeBreaker
 }
 
 // New builds the platform from config options: a2a_bin, allow_from,
@@ -125,6 +135,7 @@ func newPlatform(c Client, a Acker, opts map[string]any) *Platform {
 	return &Platform{
 		client: c, acker: a, allow: allow, roster: newRosterReceiver(opts, allow), interval: interval, maxChunk: maxChunk,
 		inflight: map[string]bool{}, done: map[string]time.Time{}, replies: map[string]int{},
+		breaker: newEmptyExchangeBreaker(DefaultEmptyExchangeLimit),
 	}
 }
 
@@ -242,6 +253,21 @@ func (p *Platform) dispatch(ctx context.Context, handler core.MessageHandler, m 
 		p.dispatchRoster(ctx, handler, m)
 		return
 	}
+	// A conversation that already burned through its empty-exchange budget must
+	// not wake the model again: ack the empty inbound and stop there. Without
+	// this, two peers that answer each other with the empty-response
+	// placeholder keep each other running. nibiru#1346.
+	if p.breaker.tripped(m.ConversationID) && isEmptyReply(m.Text) {
+		slog.Warn("a2a: empty exchange breaker tripped; message acked without a model turn",
+			"conversation", m.ConversationID, "message_id", m.MessageID)
+		if err := p.client.Ack(ctx, m.MessageID); err != nil {
+			slog.Warn("a2a: ack of breaker-dropped message failed", "message_id", m.MessageID, "error", err)
+			p.release(m.MessageID, false)
+			return
+		}
+		p.release(m.MessageID, true)
+		return
+	}
 
 	p.dispatchMessage(handler, m, m.Text, "")
 }
@@ -277,7 +303,7 @@ func (p *Platform) dispatchMessage(handler core.MessageHandler, m Inbound, conte
 		UserID:     m.SenderID,
 		UserName:   m.SenderID,
 		Content:    content,
-		ReplyCtx:   &replyContext{ConversationID: m.ConversationID, MessageIDs: []string{m.MessageID}, rosterTransferKey: rosterTransferKey},
+		ReplyCtx:   &replyContext{ConversationID: m.ConversationID, MessageIDs: []string{m.MessageID}, rosterTransferKey: rosterTransferKey, inboundEmpty: rosterTransferKey == "" && isEmptyReply(m.Text)},
 	})
 }
 
@@ -311,6 +337,16 @@ func (p *Platform) send(ctx context.Context, replyCtx any, content string) error
 	first := rc.MessageIDs[0]
 	replyTo := rc.MessageIDs[len(rc.MessageIDs)-1]
 
+	// The engine substitutes an empty-response placeholder for an empty agent
+	// reply. Delivering it would wake the peer's model, which replies empty
+	// again, and the two peers spin in a loop burning tokens. Drop the reply
+	// instead; the turn is still settled, so the inbound message is acked and
+	// never redelivered. nibiru#1346.
+	if isEmptyReply(content) {
+		slog.Info("a2a: empty reply suppressed", "conversation", rc.ConversationID, "message_id", first)
+		return nil
+	}
+
 	p.mu.Lock()
 	n := p.replies[first]
 	p.mu.Unlock()
@@ -328,6 +364,7 @@ func (p *Platform) send(ctx context.Context, replyCtx any, content string) error
 	p.mu.Lock()
 	p.replies[first]++
 	p.mu.Unlock()
+	rc.replied = true
 	return nil
 }
 
@@ -353,6 +390,11 @@ func (p *Platform) FinishTurn(_ context.Context, replyCtx any, ok bool) {
 		p.acker.TurnFailedIDs(sessionKey, rc.MessageIDs, fmt.Errorf("a2a: turn did not complete"))
 	}
 	p.finish(rc, ok)
+	if ok {
+		// An exchange counts as empty when the inbound carried no real content
+		// or when the turn delivered no real reply. nibiru#1346.
+		p.breaker.record(rc.ConversationID, rc.inboundEmpty || !rc.replied)
+	}
 }
 
 func (p *Platform) finish(rc *replyContext, ok bool) {
