@@ -90,6 +90,45 @@ func (s *APIServer) handleRuntime(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	sessions := s.runtimeSessions()
+
+	now := time.Now().UTC()
+	result := RuntimeResponse{Type: "cc-connect.runtime.v1", ObservedAt: now, Complete: true, Sessions: []RuntimeSnapshot{}}
+	running := make(map[[2]string]bool)
+	for _, session := range sessions {
+		snapshot := RuntimeSnapshot{Status: "unknown", ObservedAt: now}
+		if session != nil {
+			if provider, ok := session.(RuntimeSnapshotProvider); ok {
+				snapshot = provider.RuntimeSnapshot()
+			}
+		}
+		if !validRuntimeSnapshot(snapshot, time.Now().UTC()) {
+			snapshot.Complete = false
+			result.Complete = false
+		}
+		result.Sessions = append(result.Sessions, snapshot)
+		if snapshot.Complete && snapshot.Status == "running" {
+			running[[2]string{snapshot.ThreadID, snapshot.TurnID}] = true
+		}
+	}
+	if result.Complete {
+		n := len(running)
+		result.ActualRunningTurns = &n
+	}
+	apiJSON(w, http.StatusOK, result)
+}
+
+func isNilAgentSession(session AgentSession) bool {
+	value := reflect.ValueOf(session)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func (s *APIServer) runtimeSessions() []AgentSession {
 	// Snapshot references under the existing registry/state locks, then release
 	// them before calling optional agent code. No keys or project names escape.
 	s.mu.RLock()
@@ -132,38 +171,5 @@ func (s *APIServer) handleRuntime(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.mu.RUnlock()
-	now := time.Now().UTC()
-	result := RuntimeResponse{Type: "cc-connect.runtime.v1", ObservedAt: now, Complete: true, Sessions: []RuntimeSnapshot{}}
-	running := make(map[[2]string]bool)
-	for _, session := range sessions {
-		snapshot := RuntimeSnapshot{Status: "unknown", ObservedAt: now}
-		if session != nil {
-			if provider, ok := session.(RuntimeSnapshotProvider); ok {
-				snapshot = provider.RuntimeSnapshot()
-			}
-		}
-		if !validRuntimeSnapshot(snapshot, time.Now().UTC()) {
-			snapshot.Complete = false
-			result.Complete = false
-		}
-		result.Sessions = append(result.Sessions, snapshot)
-		if snapshot.Complete && snapshot.Status == "running" {
-			running[[2]string{snapshot.ThreadID, snapshot.TurnID}] = true
-		}
-	}
-	if result.Complete {
-		n := len(running)
-		result.ActualRunningTurns = &n
-	}
-	apiJSON(w, http.StatusOK, result)
-}
-
-func isNilAgentSession(session AgentSession) bool {
-	value := reflect.ValueOf(session)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
+	return sessions
 }

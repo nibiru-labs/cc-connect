@@ -468,6 +468,10 @@ func (s *appServerSession) storeUsage(report *core.UsageReport) {
 	s.runtimeMu.Lock()
 	defer s.runtimeMu.Unlock()
 	s.usage = cloneUsageReport(report)
+	if s.usage != nil {
+		s.usage.ObservedAt = time.Now().UTC()
+		s.usage.Stale = false
+	}
 }
 
 func (s *appServerSession) storeContextUsage(usage *core.ContextUsage) {
@@ -959,8 +963,14 @@ func (s *appServerSession) GetReasoningEffort() string {
 
 func (s *appServerSession) GetUsage(ctx context.Context) (*core.UsageReport, error) {
 	if err := s.refreshUsage(ctx); err != nil {
-		if cached := s.cachedUsage(); cached != nil {
-			return cached, nil
+		s.runtimeMu.Lock()
+		if s.usage != nil {
+			s.usage.Stale = true
+		}
+		cached := cloneUsageReport(s.usage)
+		s.runtimeMu.Unlock()
+		if cached != nil {
+			return cached, err
 		}
 		return nil, err
 	}
@@ -1205,6 +1215,12 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 		var notif appServerRateLimitsResponse
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
 			s.storeUsage(mapAppServerRateLimits(notif))
+		} else {
+			s.runtimeMu.Lock()
+			if s.usage != nil {
+				s.usage.Stale = true
+			}
+			s.runtimeMu.Unlock()
 		}
 
 	case "thread/tokenUsage/updated":

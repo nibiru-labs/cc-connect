@@ -47,9 +47,9 @@ func TestAppServerSession_HandleRateLimitsUpdatedCachesUsage(t *testing.T) {
 
 	s.handleNotification("account/rateLimits/updated", raw)
 
-	report, err := s.GetUsage(context.Background())
-	if err != nil {
-		t.Fatalf("GetUsage() returned error: %v", err)
+	report := s.cachedUsage() // This fixture has no transport; verify the event cache directly.
+	if report == nil {
+		t.Fatal("notification cache missing")
 	}
 	if report.Provider != "codex" {
 		t.Fatalf("provider = %q, want codex", report.Provider)
