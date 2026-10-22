@@ -500,13 +500,15 @@ type UsageReporter interface {
 
 // UsageReport is a provider-neutral quota snapshot returned by UsageReporter.
 type UsageReport struct {
-	Provider  string
-	AccountID string
-	UserID    string
-	Email     string
-	Plan      string
-	Buckets   []UsageBucket
-	Credits   *UsageCredits
+	ObservedAt time.Time // Local receipt time, not provider-global collection time.
+	Stale      bool      // Last refresh failed; cache readers must not treat it as current.
+	Provider   string
+	AccountID  string
+	UserID     string
+	Email      string
+	Plan       string
+	Buckets    []UsageBucket
+	Credits    *UsageCredits
 }
 
 // UsageBucket groups one logical quota, such as standard requests or code review.
